@@ -1,6 +1,6 @@
 {
     "disappearingMessagesUpdated": "<b>{adminname}</b> updated disappearing message settings.",
-    "groupMemberLeft": "<b>{name}</b> left the group.",
+    "groupMemberLeft": "<b>{name}</b> lämnade gruppen.",
     "adminMorePromotedToAdmin": "<b>{name}</b> and <b>{count} others</b> were promoted to Admin.",
     "adminTwoPromotedToAdmin": "<b>{name}</b> and <b>{othername}</b> were promoted to Admin.",
     "adminPromotedToAdmin": "<b>{name}</b> was promoted to Admin.",
@@ -8,7 +8,7 @@
     "groupRemovedMore": "<b>{name}</b> and <b>{othername}</b> were removed from the group.",
     "groupMemberTwoNew": "<b>{name}</b> and <b>{othername}</b> joined the group.",
     "groupRemovedTwo": "<b>{name}</b> and <b>{othername}</b> were removed from the group.",
-    "groupMemberNew": "<b>{name}</b> joined the group.",
+    "groupMemberNew": "<b>{name}</b> gick med i gruppen.",
     "searchMatches": "{count} of {totalcount} matches",
     "members": "{count} medlemmar",
     "callsCalledYou": "{name} called you",
