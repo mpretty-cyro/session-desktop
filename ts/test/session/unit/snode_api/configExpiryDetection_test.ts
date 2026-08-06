@@ -162,11 +162,15 @@ describe('configExpiryDetection', () => {
     });
 
     it('V8c: one unreadable sub-response alongside a readable one — the readable one is honoured', () => {
+      // The two unreadable nodes are unreadable for DIFFERENT reasons, and each is excludable only
+      // by its own guard — otherwise this vector says "unreadable" while testing one route twice.
+      // The failed node therefore carries full arrays (only `failed` can exclude it) and the other
+      // omits `unchanged` (only the readability check can).
       const result = detect(
         swarmOf(
-          { failed: true } as any,
+          { updated: [], unchanged: {}, failed: true } as any,
           { updated: [H1], unchanged: { [H2]: 1 } },
-          { updated: [] } // no unchanged key -> excluded
+          { updated: [] } // no unchanged key -> excluded on that ground alone
         )
       );
 
