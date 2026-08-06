@@ -60,16 +60,36 @@ describe('configExpiryDetection', () => {
     expect(result).to.be.deep.eq({ status: 'conclusive', missingHashes: [H2] });
   });
 
+  // ⚠️ The failed nodes below CARRY an `unchanged` array on purpose, and it must stay.
+  //
+  // Without it they are already unreadable, so the eligibility check excludes them on that ground
+  // and never consults `failed` at all — the `failed` term could then be deleted with the whole
+  // suite green. Verified: it was, and nothing died until these two fixtures gained the array.
+  //
+  // Carrying it also makes them the dangerous shape rather than a harmless one. A node that says it
+  // failed but still reports arrays is exactly the input the term exists for: read as usable, its
+  // empty arrays become authority and EVERY requested hash is reported missing — a false positive
+  // that re-stores configs the swarm still holds, on the word of a node that told us it failed.
   it('V5: a failed sub-response is excluded, not read as absence', () => {
     const result = detect(
-      swarmOf({ updated: [H1, H2], unchanged: {} }, { failed: true, timeout: true } as any)
+      swarmOf({ updated: [H1, H2], unchanged: {} }, {
+        updated: [],
+        unchanged: {},
+        failed: true,
+        timeout: true,
+      } as any)
     );
 
     expect(result).to.be.deep.eq({ status: 'conclusive', missingHashes: [] });
   });
 
   it('V6: every sub-response failed -> inconclusive, no recovery', () => {
-    const result = detect(swarmOf({ failed: true } as any, { failed: true, code: 500 } as any));
+    const result = detect(
+      swarmOf(
+        { updated: [], unchanged: {}, failed: true } as any,
+        { updated: [], unchanged: {}, failed: true, code: 500 } as any
+      )
+    );
 
     expect(result).to.be.deep.eq({ status: 'inconclusive' });
   });
