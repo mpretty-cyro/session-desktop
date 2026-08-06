@@ -7,7 +7,7 @@ import { ExpireMessagesResultsContent } from '../../../../session/apis/snode_api
 const { expect } = chai;
 
 /**
- * The vectors from CONFIG_EXPIRY_DETECTION_SPEC.md §6, one test each. iOS and Android implement
+ * The shared detection vectors, one test each. iOS and Android implement
  * the same rule separately, and these vectors are the only thing keeping the three in agreement —
  * so don't relax one to make an implementation pass, change the spec.
  */
@@ -155,7 +155,7 @@ describe('configExpiryDetection', () => {
 
     it('V14: asking about no hashes is INCONCLUSIVE, not "nothing missing"', () => {
       // This test previously asserted 'conclusive' — the natural short-circuit, and wrong. A
-      // conclusive result outranks the empty-fetch check in the §3.5 authority table, so reporting
+      // conclusive result outranks the empty-fetch check, so reporting
       // one here would make detection the authority for a swarm it never asked about, and the
       // check that should decide the no-hashes case could never fire.
       const result = detect(swarmOf({ updated: [], unchanged: {} }), { requestedHashes: [] });

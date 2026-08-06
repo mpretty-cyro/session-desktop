@@ -32,7 +32,7 @@ const { expect } = chai;
  * ConfigRecovery directly.
  *
  * A device whose config has expired gets nothing back when it polls, because there is nothing left
- * on the swarm to return. Guard §4.1 originally read "a successful poll *and merge*", and taken
+ * on the swarm to return. The level-with-swarm rule originally read "a successful poll *and merge*", and taken
  * literally that means recovery can never run for exactly those devices — and it fails silently:
  * detection runs, the guard declines, no error and no failing test.
  *
@@ -130,6 +130,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(
       ConfigRecovery.localStateIsLevelWithSwarm(ourNumber),
@@ -153,6 +155,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(retrieveStub.called, 'the poll must actually have been attempted').to.be.true;
     expect(
@@ -178,6 +182,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(retrieveStub.called, 'the poll must actually have been attempted').to.be.true;
     expect(
@@ -203,6 +209,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(ConfigRecovery.localStateIsLevelWithSwarm(ourNumber)).to.be.true;
     expect(sendStub.called, 'this is the real expired-device path — it MUST recover').to.be.true;
@@ -230,6 +238,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     // Proves the path reached the decision rather than dying earlier. Without this the assertion
     // below passes over a dead harness, because a poll that never ran also leaves us "not level" —
@@ -260,6 +270,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(ConfigRecovery.localStateIsLevelWithSwarm(ourNumber)).to.be.true;
     expect(sendStub.called, 'proves the path in V22c actually runs').to.be.true;
@@ -290,6 +302,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(mergeStub.callCount, 'the merge must actually have been reached').to.be.eq(1);
     expect(
@@ -324,6 +338,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(ConfigRecovery.localStateIsLevelWithSwarm(ourNumber)).to.be.true;
     expect(sendStub.called, 'proves the partial case above is a real distinction').to.be.true;
@@ -352,6 +368,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
     // Every other assertion in this test is satisfied by "nothing happened", so without this the
     // whole vector is a false green under any death that stops the poll early — found by reading
     // the SURVIVORS of a harness-death run rather than its failures.
@@ -364,6 +382,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     mergeHandler.resolves(true);
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(
       ConfigRecovery.localStateIsLevelWithSwarm(ourNumber),
@@ -386,12 +406,16 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     });
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
     expect(ConfigRecovery.localStateIsLevelWithSwarm(ourNumber), 'poll N failed').to.be.false;
 
     // the swarm comes back; nothing was lost, so this must recover
     retrieveStub.resolves([]);
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(
       ConfigRecovery.localStateIsLevelWithSwarm(ourNumber),
@@ -429,6 +453,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
 
     // the load-bearing half: the poll itself must complete
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(
       mergeHandler.callCount,
@@ -436,7 +462,7 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     ).to.be.eq(1);
     expect(
       ConfigRecovery.localStateIsLevelWithSwarm(ourNumber),
-      'and the poll completed far enough to reach the §4.1 marker'
+      'and the poll completed far enough to reach the level-with-swarm marker'
     ).to.be.true;
 
     // and the recovery half: nothing barred, nothing consumed, still retryable
@@ -449,6 +475,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
     retrieveStub.resolves([]);
 
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(
       sendStub.called,
@@ -458,6 +486,8 @@ describe('SwarmPolling: config recovery on an empty poll (V22)', () => {
 
   it('being level is a precondition, not a trigger: nothing detected -> no re-store', async () => {
     await swarmPolling.pollOnceForKey([ourNumber, ConversationTypeEnum.PRIVATE]);
+    // the poller deliberately does not await recovery, so wait for the round it started
+    await ConfigRecovery.waitForRecoveryForTesting(ourNumber);
 
     expect(ConfigRecovery.localStateIsLevelWithSwarm(ourNumber)).to.be.true;
     expect(sendStub.called, 'being level is a precondition, not a trigger').to.be.false;

@@ -1,24 +1,45 @@
 /* eslint-disable no-await-in-loop */
 import AbortController from 'abort-controller';
-import { PubkeyType } from 'libsession_util_nodejs';
+import { GroupPubkeyType, PubkeyType } from 'libsession_util_nodejs';
 import { chunk, isEmpty } from 'lodash';
 import { UserUtils } from '../../utils';
 import type { ConfigWrapperUser } from '../../../webworker/workers/browser/libsession_worker_functions';
-import { UserGenericWrapperActions } from '../../../webworker/workers/browser/libsession_worker_interface';
+import {
+  MetaGroupWrapperActions,
+  UserGenericWrapperActions,
+  UserGroupsWrapperActions,
+} from '../../../webworker/workers/browser/libsession_worker_interface';
 import { LibSessionUtil } from '../../utils/libsession/libsession_utils';
 import { DURATION, TTL_DEFAULT } from '../../constants';
 import { NetworkTime } from '../../../util/NetworkTime';
 import { MessageSender } from '../../sending/MessageSender';
 import { timeoutWithAbort } from '../../utils/Promise';
 import {
+  DeleteHashesFromGroupNodeSubRequest,
   DeleteHashesFromUserNodeSubRequest,
   MAX_SUBREQUESTS_COUNT,
+  StoreGroupInfoSubRequest,
+  StoreGroupMembersSubRequest,
   StoreUserConfigSubRequest,
 } from './SnodeRequestTypes';
 import { ConfigExpiryDetection } from './configExpiryDetection';
 import { ed25519Str } from '../../utils/String';
+import { PubKey } from '../../types';
 
 type SnodeSubRequestForRecovery = StoreUserConfigSubRequest | DeleteHashesFromUserNodeSubRequest;
+
+type StoreGroupConfigSubRequestForRecovery = StoreGroupInfoSubRequest | StoreGroupMembersSubRequest;
+type GroupSubRequestForRecovery =
+  | StoreGroupConfigSubRequestForRecovery
+  | DeleteHashesFromGroupNodeSubRequest;
+
+/**
+ * An ACCOUNT pubkey — our own (`05…`) or a group's (`03…`). Never a snode's ed25519 key.
+ *
+ * Spelled out because everything here is "per swarm", and a swarm is identified by the account
+ * whose swarm it is; a bare `string` left a reader working that out from the call sites.
+ */
+type AccountPubkey = PubkeyType | GroupPubkeyType;
 
 /**
  * Putting a config message back on the swarm after it expired from it.
@@ -29,54 +50,61 @@ type SnodeSubRequestForRecovery = StoreUserConfigSubRequest | DeleteHashesFromUs
  * dirty a config to force an upload — that would bump the seqno and trigger a merge, and turn a
  * repair into the destructive thing this design exists to avoid.
  *
- * See CONFIG_EXPIRY_DETECTION_SPEC.md §4 (guards) and §5 (the action).
+ * Both our own configs and a group's are recovered here. The two differ only in how a config is
+ * inspected and put back, so the guards and the bookkeeping are shared and the split happens as
+ * late as possible.
  *
- * Note: group configs are detected but NOT recovered here. The NodeJS wrapper's
- * `MetaGroupWrapper::push()` returns null for any sub-config whose `needs_push()` is false, and
- * §4.2 only lets us re-store a config that is clean — i.e. exactly when it returns null. There is
- * no way to reach the bytes until the wrapper exposes an unconditional serialise.
- *
- * When that lands and group recovery is wired up, note that the obsolete-hash handling below does
- * *not* carry over unchanged. A group member holds its configs read-only, and `push()` hands back
- * the superseded hashes only `if (!is_readonly())` while clearing them either way
- * (`base.cpp:809-813`). So on the member path an empty list is the expected result, not a sign
- * anything failed — and a member could not act on it anyway, since its subaccount token carries
- * Read+Write but not Delete. Member-driven recovery re-stores but never prunes; the superseded
- * messages wait for an admin's next push.
+ * Three things about the group path are easy to mistake for bugs:
+ *   - `GroupKeys` is detect-only. A keys message cannot be re-emitted; only an admin rekey produces
+ *     a new one. A missing keys hash is reported and settled, never retried.
+ *   - a MEMBER gets an empty obsolete-hash list. `push()` hands the superseded hashes back only
+ *     `if (!is_readonly())` while clearing them either way (`base.cpp:809-813`), so empty is the
+ *     expected result rather than a sign anything failed.
+ *   - a member could not act on a non-empty list anyway: its subaccount token carries Read+Write
+ *     but not Delete. Member-driven recovery re-stores and never prunes; the superseded messages
+ *     wait for an admin's next push.
  */
 
 /**
- * None of this state is persisted, deliberately rather than merely unimplemented: guard §4.1 asks
+ * None of this state is persisted, deliberately rather than merely unimplemented: the level-with-swarm rule asks
  * what has happened since this process started, so a verdict reloaded from disk would be answering
  * that question about a previous run.
  *
  * The scoping is NOT uniform across these declarations, though it reads as if it should be and it
  * once was — the two Sets below are session-scoped, `hashSettledAt` is time-bounded.
  */
-const swarmsLevelWithLocalState = new Set<string>();
-const swarmsWithIncompleteMerge = new Set<string>();
+const swarmsLevelWithLocalState = new Set<AccountPubkey>();
+const swarmsWithIncompleteMerge = new Set<AccountPubkey>();
 /**
  * hash -> when it was settled, for either of two reasons that must not be conflated with a FAILED
- * store (which stays retryable — §5.5 as amended in spec v40):
+ * store, which stays retryable:
  *   - it was stored successfully; or
  *   - a guard ruled it out.
  *
  * ⚠️ A Map rather than a Set, and "at" rather than "this session", because the bar is TIME-BOUNDED
  * — see HASH_BAR_MS. This was first written as a permanent, session-scoped bar, justified by the
  * claim that no guard's verdict can change within a session. That sentence is false on any session
- * measured in hours, which on Desktop is all of them (§5.3, no foreground gate): a kicked group can
+ * measured in hours, which on Desktop is all of them (there is no foreground gate): a kicked group can
  * be rejoined, a destroyed one replaced, a dirty config settle. Re-examining a guard costs no
  * network call, so a permanent bar buys nothing and silently withdraws the device.
  */
 const hashSettledAt = new Map<string, number>();
-const missingHashesByPubkey = new Map<string, Set<string>>();
+const missingHashesByPubkey = new Map<AccountPubkey, Set<string>>();
+/**
+ * Swarms with a recovery round currently running — see the guard at the top of recoverIfNeeded.
+ *
+ * Holds the round's promise rather than just a marker, so a caller that wants to know when the
+ * round finishes can await it. Nothing in production does (the poller deliberately does not wait),
+ * but it is what lets a test assert on the outcome of an unawaited round without sleeping.
+ */
+const recoveryInFlight = new Map<AccountPubkey, Promise<boolean>>();
 const recoveryAttemptsBySwarm = new Map<
-  string,
+  AccountPubkey,
   { consecutiveFailures: number; lastAttemptAt: number }
 >();
 
 /**
- * §5.5 — recovery attempts for one swarm are RATE-LIMITED, deliberately not capped.
+ * Recovery attempts for one swarm are RATE-LIMITED, deliberately not capped.
  *
  * Releasing a failed attempt for retry and bounding the retries are a pair; either alone is wrong.
  * Without the release, a partial failure is banked as done and never repaired. Without the bound, a
@@ -84,11 +112,14 @@ const recoveryAttemptsBySwarm = new Map<
  * storm this design exists to avoid.
  *
  * ⚠️ Why a backoff and NOT a "give up after N rounds" cap, which is what this was first written as:
- * a cap re-creates the very exclusion §5.5 was corrected to remove, one layer up. Three transient
+ * a cap re-creates the very exclusion the rate limit was corrected to remove, one layer up. Three transient
  * network failures would withdraw the device for the rest of the session — and a Desktop session can
  * be days — while intermittent connectivity correlates with having been offline long enough for the
  * config to expire in the first place. So the cap would exclude exactly the population the feature
- * exists for (spec §4.4a). A backoff bounds the RATE without ever excluding anyone.
+ * exists for. A backoff bounds the RATE without ever excluding anyone.
+ *
+ * That test — WHICH POPULATION DOES THIS EXCLUDE, AND DOES IT CORRELATE WITH NEEDING THE REPAIR? —
+ * is worth applying to any bound added here. It has caught this same mistake twice.
  *
  * Note the real request count is NOT one per attempt: `sendEncryptedDataToSnode` wraps each send in
  * pRetry with `retries: 2`, so the worst case is 3 attempts x (parts + 1 delete) per entry below.
@@ -103,13 +134,13 @@ const recoveryAttemptsBySwarm = new Map<
 let nowMs: () => number = () => Date.now();
 
 /**
- * §5.5 — how long a successfully re-stored hash is barred from being re-stored again.
+ * How long a successfully re-stored hash is barred from being re-stored again.
  *
  * ⚠️ NOT "for the session". A session is unbounded in time and the config TTL is 30 days, so on
- * Desktop — which per §5.3 has no foreground gate and runs for weeks by design — a session-scoped
+ * Desktop — which has no foreground gate and runs for weeks by design — a session-scoped
  * bar can outlive the TTL. The hash would then expire from the swarm a second time and the bar
  * would block the very recovery that should put it back, on exactly the long-lived sessions where
- * configs expire. §4.4a again.
+ * configs expire: the bound would exclude exactly the population it exists to serve.
  *
  * One hour, standardised across the three clients. The figure is NOT load-bearing — the property
  * is "hours" — so don't tune it as though something depends on it. It errs short because the two
@@ -124,14 +155,14 @@ const RECOVERY_BACKOFF_CEILING_MS = 30 * DURATION.MINUTES;
 
 /**
  * How long to wait before the next recovery round for a swarm, given consecutive FAILED rounds.
- * 60s doubling, ceilinged at 30 minutes, reset to zero by any successful store (spec §5.4).
+ * 60s doubling, ceilinged at 30 minutes, reset to zero by any successful store.
  *
  * ⚠️ The ceiling bounds the INTERVAL, never the NUMBER OF ATTEMPTS. This must not become a
- * consecutive-failure cap: that is the §4.4a shape this feature has already produced twice, and it
+ * consecutive-failure cap: that is the exclusion shape this feature has already produced twice, and it
  * would exclude exactly the swarms most in need of repair. A permanently failing swarm keeps being
  * retried, just rarely — ~48 rounds a day rather than ~1,440.
  *
- * Growth matters more here than on mobile: per §5.3 Desktop has no foreground gate, so a "session"
+ * Growth matters more here than on mobile: Desktop has no foreground gate, so a "session"
  * is however long the app stays open, which is days rather than minutes.
  */
 function backoffMsFor(consecutiveFailures: number) {
@@ -145,7 +176,7 @@ function backoffMsFor(consecutiveFailures: number) {
 }
 
 /**
- * Guard §4.1 — our local state must be level with the swarm before anything may be re-stored.
+ * Our local state must be level with the swarm before anything may be re-stored.
  * That stops a long-offline device putting back state that has since been deliberately changed:
  * the dangerous ordering is re-storing while the swarm still holds config we haven't merged.
  *
@@ -163,7 +194,7 @@ function backoffMsFor(consecutiveFailures: number) {
  *
  * A failed or errored poll counts for neither.
  */
-function markLocalStateLevelWithSwarm(pubkey: string) {
+function markLocalStateLevelWithSwarm(pubkey: AccountPubkey) {
   if (swarmsWithIncompleteMerge.has(pubkey)) {
     // withdrawn for the session — see markMergeIncompleteForSwarm
     return;
@@ -184,9 +215,9 @@ function markLocalStateLevelWithSwarm(pubkey: string) {
  * A per-poll check alone is therefore cosmetic. Note the fix is NOT to advance the cursor only on a
  * successful merge — that would re-fetch a permanently unmergeable message forever. Recovery is a
  * best-effort repair, so deferring it to the next app start costs almost nothing, where acting on a
- * view we know to be incomplete is the thing guard §4.1 exists to prevent.
+ * view we know to be incomplete is the thing this precondition exists to prevent.
  *
- * ⚠️ Known correlated exclusion — recorded in spec §4.1, found via the §4.4a lens. "Deferred to the
+ * ⚠️ Known correlated exclusion, found by asking which population this excludes. "Deferred to the
  * next app start" is only true for a
  * TRANSIENT merge failure. If a config message on the swarm is *permanently* unmergeable — corrupt,
  * or written by a client newer than we can parse — then every session fetches it, fails, and
@@ -196,20 +227,20 @@ function markLocalStateLevelWithSwarm(pubkey: string) {
  * Kept anyway, because the alternative is re-storing over state we know we could not read, which is
  * worse than not repairing. Named here so nobody later re-derives it as harmless.
  */
-function markMergeIncompleteForSwarm(pubkey: string) {
+function markMergeIncompleteForSwarm(pubkey: AccountPubkey) {
   swarmsWithIncompleteMerge.add(pubkey);
   swarmsLevelWithLocalState.delete(pubkey);
 }
 
-function localStateIsLevelWithSwarm(pubkey: string) {
+function localStateIsLevelWithSwarm(pubkey: AccountPubkey) {
   return swarmsLevelWithLocalState.has(pubkey);
 }
 
 /**
  * Detection runs on every poll, including ones we won't act on. Recording it separately from
- * acting on it is what lets §4.1 hold without throwing the detection away.
+ * acting on it is what lets the precondition hold without throwing the detection away.
  */
-function recordDetection(pubkey: string, detection: ConfigExpiryDetection) {
+function recordDetection(pubkey: AccountPubkey, detection: ConfigExpiryDetection) {
   if (detection.status !== 'conclusive') {
     // 'unavailable' and 'inconclusive' are not evidence of anything.
     return;
@@ -246,14 +277,14 @@ function pruneExpiredBars() {
   });
 }
 
-function getMissingHashes(pubkey: string) {
+function getMissingHashes(pubkey: AccountPubkey) {
   return [...(missingHashesByPubkey.get(pubkey) ?? [])];
 }
 
 /**
  * Which of our user configs need putting back, given the hashes reported missing.
  *
- * Applies guard §4.2 (clean only) and §4.3 (current hashes only — `activeHashes()` *is* the set of
+ * Applies two guards: clean configs only, and current hashes only (`activeHashes()` *is* the set of
  * hashes the device believes are current, so a hash that has since been superseded simply isn't in
  * it any more).
  */
@@ -269,7 +300,7 @@ async function userVariantsNeedingRestore(missingHashes: Array<string>) {
     const variant = LibSessionUtil.requiredUserVariants[index];
 
     try {
-      // §4.2: recovery re-uploads existing state, it never creates new state. A config with
+      // Clean only: recovery re-uploads existing state, it never creates new state. A config with
       // pending changes will be pushed by the UserSyncJob anyway, which supersedes this.
       if (await UserGenericWrapperActions.needsPush(variant)) {
         continue;
@@ -294,7 +325,7 @@ async function userVariantsNeedingRestore(missingHashes: Array<string>) {
 }
 
 /**
- * @returns `stored` — every part of every config landed, which is what §5.5 bars a hash on (§3.4:
+ * @returns `stored` — every part of every config landed, which is what bars a hash from retry (
  * a multipart config counts as stored only when all its parts do).
  * @returns `anyPartLanded` — at least one store sub-request came back 200. Deliberately separate:
  * a multipart config that repeatedly half-lands is making PROGRESS, not failing, because the parts
@@ -320,7 +351,7 @@ async function restoreUserConfigs(
 
     restores.push({
       variant,
-      // §3.4: every part of a multipart config goes back, not just the parts reported missing. The
+      // Every part of a multipart config goes back, not just the parts reported missing. The
       // present ones re-encrypt to the same bytes, so they cost a no-op TTL refresh — and
       // `activeHashes()` is unordered, so a part hash can't be mapped to its index here anyway.
       stores: data.map(
@@ -332,7 +363,7 @@ async function restoreUserConfigs(
             getNow: NetworkTime.now,
           })
       ),
-      // §5.1: push() drains the config's obsolete-hash list and clears it unconditionally, so this
+      // push() drains the config's obsolete-hash list and clears it unconditionally, so this
       // is the only time we will ever see these. Held per-config rather than pooled, because the
       // delete must only cover configs whose stores actually landed.
       obsoleteHashes: hashes,
@@ -350,7 +381,7 @@ async function restoreUserConfigs(
   // sending, which is worse for being silent: the throw lands in recoverIfNeeded's catch and an
   // affected account simply never recovers.)
   //
-  // So split across batches rather than dropping anything. §3.4 governs when a multipart config
+  // So split across batches rather than dropping anything. The all-parts rule governs when a config
   // COUNTS AS STORED, not which transport its parts travel in. Skipping instead would make a config
   // over ~1.5MB permanently unrecoverable.
   const landed = new Map<StoreUserConfigSubRequest, boolean>();
@@ -403,10 +434,10 @@ async function restoreUserConfigs(
   const fullyLanded = restores.filter(r => r.stores.every(store => landed.get(store) === true));
   const anyPartLanded = [...landed.values()].some(Boolean);
 
-  // §5.1, as amended: the delete covers only the configs that FULLY landed. An obsolete hash whose
+  // The delete covers only the configs that FULLY landed. An obsolete hash whose
   // replacement did not store is the swarm's only older copy of that config — deleting it would
   // leave a seed restore in that window with nothing rather than something stale. And in the case
-  // §5.1 was actually written for the delete is a no-op anyway: an obsolete hash is never
+  // the sweep was actually written for, the delete is a no-op anyway: an obsolete hash is never
   // TTL-extended (active_hashes() covers _curr_hashes only), so if the CURRENT hash lived long
   // enough to expire, its predecessor necessarily expired before it.
   const deletableHashes = fullyLanded.flatMap(r => r.obsoleteHashes);
@@ -428,29 +459,254 @@ async function restoreUserConfigs(
   return { stored: fullyLanded.length === restores.length, anyPartLanded };
 }
 
+/** the two group sub-configs recovery can put back. GroupKeys is deliberately absent — see below. */
+type RestorableGroupConfig = 'groupInfo' | 'groupMember';
+
+/**
+ * Which of a group's sub-configs claim one of the missing hashes.
+ *
+ * GroupKeys is inspected but never restorable. A keys message cannot be re-emitted — only an admin
+ * rekey produces a new one — so a missing keys hash is reported and left alone rather than being
+ * treated as a failure to repair. That limit is the same on all three clients.
+ */
+async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashes: Array<string>) {
+  const needingRestore: Array<RestorableGroupConfig> = [];
+  const coveredHashes = new Set<string>();
+
+  try {
+    const group = await UserGroupsWrapperActions.getGroup(groupPk);
+
+    // We are no longer entitled to write to this swarm, and for a destroyed group there is
+    // nothing to put back. Note both flags: `kicked` is false when the group was `destroyed`, so
+    // checking one alone silently misses the other population.
+    if (!group || group.kicked || group.destroyed) {
+      return { needingRestore, coveredHashes, inspectedEverything: true };
+    }
+
+    // Clean configs only. A group with pending changes is about to be pushed by GroupSync
+    // under new hashes, which supersedes anything we would put back.
+    if (await MetaGroupWrapperActions.needsPush(groupPk)) {
+      return { needingRestore, coveredHashes, inspectedEverything: true };
+    }
+
+    // Only hashes the wrapper still considers active. Per-config, because the answer differs
+    // per config: `activeHashes()` merges all three and cannot tell a restorable groupInfo hash
+    // from an unrestorable groupKeys one.
+    const byConfig = await MetaGroupWrapperActions.activeHashesByConfig(groupPk);
+
+    const missingKeysHashes = byConfig.groupKeys.filter(hash => missingHashes.includes(hash));
+    if (missingKeysHashes.length) {
+      // Counted as COVERED so it settles rather than being re-examined on every poll forever. It is
+      // not an un-attempted restore; it is a restore that can never exist.
+      missingKeysHashes.forEach(hash => coveredHashes.add(hash));
+      window.log.warn(
+        `ConfigRecovery: ${missingKeysHashes.length} GroupKeys hash(es) missing for ${ed25519Str(groupPk)} — only an admin rekey can replace those`
+      );
+    }
+
+    (['groupInfo', 'groupMember'] as const).forEach(config => {
+      const claimed = byConfig[config].filter(hash => missingHashes.includes(hash));
+      if (claimed.length) {
+        needingRestore.push(config);
+        claimed.forEach(hash => coveredHashes.add(hash));
+      }
+    });
+
+    return { needingRestore, coveredHashes, inspectedEverything: true };
+  } catch (e) {
+    // as on the user path: a throw is not a guard verdict, so nothing settles on this pass
+    window.log.warn(
+      `ConfigRecovery: could not inspect group ${ed25519Str(groupPk)}: ${e.message}. Skipping it.`
+    );
+    return { needingRestore: [], coveredHashes, inspectedEverything: false };
+  }
+}
+
+/**
+ * Put a group's clean `groupInfo`/`groupMember` configs back on its swarm.
+ *
+ * Returns the same pair as the user path — see `restoreUserConfigs` for what `stored` and
+ * `anyPartLanded` mean and why they are separate.
+ */
+async function restoreGroupConfigs(
+  groupPk: GroupPubkeyType,
+  configs: Array<RestorableGroupConfig>
+): Promise<{ stored: boolean; anyPartLanded: boolean }> {
+  const group = await UserGroupsWrapperActions.getGroup(groupPk);
+  if (!group) {
+    return { stored: false, anyPartLanded: false };
+  }
+
+  // `pushForRecovery` ignores needs_push() and hands back groupInfo and groupMember only — there is
+  // no groupKeys key on the result at all, so the unrestorable config cannot be sent by accident.
+  //
+  // ⚠️ It DRAINS the obsolete-hash list despite reading like a query, because it calls push()
+  // underneath. So this is the only time we will see those hashes, exactly as on the user path.
+  const pushed = await MetaGroupWrapperActions.pushForRecovery(groupPk);
+
+  const byConfig = await MetaGroupWrapperActions.activeHashesByConfig(groupPk);
+
+  const restores = configs.map(config => ({
+    config,
+    // Every part goes back again here, not just the parts reported missing.
+    stores: pushed[config].data.map(ciphertext =>
+      config === 'groupInfo'
+        ? new StoreGroupInfoSubRequest({
+            encryptedData: ciphertext,
+            groupPk,
+            secretKey: group.secretKey,
+            authData: group.authData,
+            ttlMs: TTL_DEFAULT.CONFIG_MESSAGE,
+            getNow: NetworkTime.now,
+          })
+        : new StoreGroupMembersSubRequest({
+            encryptedData: ciphertext,
+            groupPk,
+            secretKey: group.secretKey,
+            authData: group.authData,
+            ttlMs: TTL_DEFAULT.CONFIG_MESSAGE,
+            getNow: NetworkTime.now,
+          })
+    ),
+    obsoleteHashes: pushed[config].hashes,
+    activeHashes: byConfig[config],
+  }));
+
+  const allStores = restores.flatMap(r => r.stores);
+  if (!allStores.length) {
+    return { stored: false, anyPartLanded: false };
+  }
+
+  const landed = new Map<StoreGroupConfigSubRequestForRecovery, boolean>();
+
+  const sendBatch = async (batch: Array<GroupSubRequestForRecovery>) => {
+    const controller = new AbortController();
+    const result = await timeoutWithAbort(
+      MessageSender.sendEncryptedDataToSnode({
+        sortedSubRequests: batch,
+        destination: groupPk,
+        method: 'sequence',
+        abortSignal: controller.signal,
+        allow401s: false,
+      }),
+      30 * DURATION.SECONDS,
+      controller
+    );
+
+    if (!result || result.length !== batch.length) {
+      window.log.warn(
+        `ConfigRecovery: unexpected result length for ${ed25519Str(groupPk)}: expected ${batch.length} but got ${result?.length}`
+      );
+      return false;
+    }
+
+    batch.forEach((request, i) => {
+      if (
+        request instanceof StoreGroupInfoSubRequest ||
+        request instanceof StoreGroupMembersSubRequest
+      ) {
+        landed.set(request, result[i].code === 200);
+      }
+    });
+
+    return result.every(m => m.code === 200);
+  };
+
+  const storeBatches = chunk(allStores, MAX_SUBREQUESTS_COUNT);
+  window.log.info(
+    `ConfigRecovery: re-storing ${allStores.length} config message(s) for group ${ed25519Str(groupPk)} in ${storeBatches.length} batch(es) (configs: ${configs.join(', ')})`
+  );
+
+  for (let i = 0; i < storeBatches.length; i++) {
+    const ok = await sendBatch(storeBatches[i]);
+    if (!ok) {
+      break;
+    }
+  }
+
+  const fullyLanded = restores.filter(r => r.stores.every(store => landed.get(store) === true));
+  const anyPartLanded = [...landed.values()].some(Boolean);
+
+  // Same sweep rule as the user path, but note what it means for a MEMBER, because it looks like a
+  // bug from either side:
+  //   - push() hands the superseded hashes back only `if (!is_readonly())` while clearing them
+  //     either way, so a member gets an EMPTY list. That is the expected result, not a failure.
+  //   - a member could not act on a non-empty one anyway: its subaccount token carries Read+Write
+  //     but NOT Delete, so the delete would 401.
+  // Member-driven recovery therefore re-stores but never prunes; the superseded messages wait for
+  // an admin's next push. Only attempt the delete when we hold the admin key.
+  const adminSecretKey = group.secretKey?.length ? group.secretKey : null;
+  const deletableHashes = adminSecretKey ? fullyLanded.flatMap(r => r.obsoleteHashes) : [];
+
+  if (adminSecretKey && deletableHashes.length) {
+    await sendBatch([
+      new DeleteHashesFromGroupNodeSubRequest({
+        messagesHashes: [...new Set(deletableHashes)],
+        groupPk,
+        secretKey: adminSecretKey,
+      }),
+    ]);
+  }
+
+  fullyLanded.forEach(r => r.activeHashes.forEach(hash => hashSettledAt.set(hash, nowMs())));
+
+  if (fullyLanded.length) {
+    // pushForRecovery mutated the wrapper (it drained the obsolete hashes), so that has to persist
+    await LibSessionUtil.saveDumpsToDb(groupPk);
+  }
+
+  return { stored: fullyLanded.length === restores.length, anyPartLanded };
+}
+
 /**
  * Act on whatever detection has recorded for this swarm. Safe to call on every poll — the guards
  * below are what make it a no-op almost every time.
  *
- * Note on §5.3 ("foreground only"): that rule exists because on mobile the largest recovery
+ * Note on the "foreground only" rule the mobile clients follow: it exists because on mobile the largest recovery
  * coincides with a constrained background execution window. Desktop has no such window — the
  * process is either running and polling or not running at all — so there is nothing here to
  * defer to. Gating on window focus would only stop a minimised client from repairing itself.
  */
-async function recoverIfNeeded(pubkey: string) {
+async function recoverIfNeeded(pubkey: AccountPubkey) {
+  // The caller does not await us — see the note at the call site in swarmPolling — so a round can
+  // still be in flight when the next poll comes round. A round that has not finished has not
+  // settled its hashes yet, so without this the second poll re-reads the same missing hashes and
+  // issues the same stores. Deterministic encryption makes those idempotent, so nothing corrupts;
+  // what it costs is duplicate traffic and doubled batch pressure aimed at the one swarm we already
+  // know is struggling.
+  // Check-then-set with no await between them, so the two cannot interleave.
+  if (recoveryInFlight.has(pubkey)) {
+    return false;
+  }
+  const round = runRecoveryRound(pubkey);
+  recoveryInFlight.set(pubkey, round);
+
   try {
-    if (!UserUtils.isUsFromCache(pubkey)) {
-      // group configs are detected but not recoverable on Desktop yet — see the note at the top.
+    return await round;
+  } finally {
+    // `finally`, not the end of the try: runRecoveryRound catches its own errors, but an in-flight
+    // entry that leaked on any path would withdraw the swarm permanently — the exclusion shape this
+    // design has already produced twice.
+    recoveryInFlight.delete(pubkey);
+  }
+}
+
+async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
+  try {
+    const isUs = UserUtils.isUsFromCache(pubkey);
+    if (!isUs && !PubKey.is03Pubkey(pubkey)) {
+      // neither our swarm nor a group's: nothing here knows how to recover it
       return false;
     }
 
-    // §4.1
+    // Nothing may be re-stored until we know our local state is level with the swarm — otherwise
+    // we would be re-uploading a view we already know is behind.
     if (!localStateIsLevelWithSwarm(pubkey)) {
       return false;
     }
 
     const missingHashes = getMissingHashes(pubkey).filter(
-      // §5.5 — barred for a bounded interval rather than for the session
+      // barred for a bounded interval rather than for the session
       hash => {
         const settledAt = hashSettledAt.get(hash);
         return settledAt === undefined || nowMs() - settledAt >= HASH_BAR_MS;
@@ -463,8 +719,12 @@ async function recoverIfNeeded(pubkey: string) {
       return false;
     }
 
-    const { needingRestore, coveredHashes, inspectedEverything } =
-      await userVariantsNeedingRestore(missingHashes);
+    // The guards above and the bookkeeping below are identical for both; only the inspection and
+    // the restore know the difference between a user config and a group sub-config.
+    const inspection = isUs
+      ? await userVariantsNeedingRestore(missingHashes)
+      : await groupConfigsNeedingRestore(pubkey as GroupPubkeyType, missingHashes);
+    const { needingRestore, coveredHashes, inspectedEverything } = inspection;
 
     // "not stored" is three outcomes, not two. A hash no restorable config claims was ruled out by a
     // guard — not active any more, or belonging to a dirty config that will be pushed under a new
@@ -486,7 +746,7 @@ async function recoverIfNeeded(pubkey: string) {
       return false;
     }
 
-    // §5.5 — the other half of releasing a failed attempt. A store that keeps failing leaves its
+    // The other half of releasing a failed attempt. A store that keeps failing leaves its
     // hashes unmarked so the next poll retries, which is correct; unbounded, that retry is every few
     // seconds forever. Rate-limited rather than capped, so a device with flaky connectivity keeps
     // getting chances instead of being written off for the session.
@@ -496,9 +756,14 @@ async function recoverIfNeeded(pubkey: string) {
       return false;
     }
 
-    const { stored, anyPartLanded } = await restoreUserConfigs(needingRestore);
+    const { stored, anyPartLanded } = isUs
+      ? await restoreUserConfigs(needingRestore as Array<ConfigWrapperUser>)
+      : await restoreGroupConfigs(
+          pubkey as GroupPubkeyType,
+          needingRestore as Array<RestorableGroupConfig>
+        );
 
-    // §5.4 — reset on PROGRESS, not on completion. Gated on its own value rather than reusing the
+    // Reset on PROGRESS, not on completion. Gated on its own value rather than reusing the
     // one that bars hashes: those answer different questions, and letting a single boolean serve
     // both is how this ended up backing off against a swarm that was converging.
     recoveryAttemptsBySwarm.set(pubkey, {
@@ -527,6 +792,16 @@ function resetForTesting() {
   recoveryAttemptsBySwarm.clear();
   hashSettledAt.clear();
   missingHashesByPubkey.clear();
+  recoveryInFlight.clear();
+}
+
+/**
+ * Exported for tests only. The poller does not await recovery, so a test that drives a poll has to
+ * be able to wait for the round it started; without this it would have to sleep and hope.
+ * Resolves immediately when no round is running.
+ */
+async function waitForRecoveryForTesting(pubkey: AccountPubkey) {
+  await recoveryInFlight.get(pubkey);
 }
 
 /** exported for tests only — the leak this guards is otherwise unobservable from outside */
@@ -544,4 +819,5 @@ export const ConfigRecovery = {
   getMissingHashes,
   recoverIfNeeded,
   resetForTesting,
+  waitForRecoveryForTesting,
 };

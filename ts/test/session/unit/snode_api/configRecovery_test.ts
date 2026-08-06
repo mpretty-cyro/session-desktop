@@ -4,7 +4,10 @@ import Sinon from 'sinon';
 import { PubkeyType } from 'libsession_util_nodejs';
 
 import { ConfigRecovery } from '../../../../session/apis/snode_api/configRecovery';
-import { UserGenericWrapperActions } from '../../../../webworker/workers/browser/libsession_worker_interface';
+import {
+  UserGenericWrapperActions,
+  UserGroupsWrapperActions,
+} from '../../../../webworker/workers/browser/libsession_worker_interface';
 import { LibSessionUtil } from '../../../../session/utils/libsession/libsession_utils';
 import { MessageSender } from '../../../../session/sending/MessageSender';
 import { UserUtils } from '../../../../session/utils';
@@ -18,7 +21,7 @@ import { TestUtils } from '../../../test-utils';
 const { expect } = chai;
 
 /**
- * The guard and action vectors from CONFIG_EXPIRY_DETECTION_SPEC.md §6 — V10-V13, V17 and V18.
+ * The shared guard and action vectors — V10-V13, V17 and V18.
  * The response-shaped vectors live in configExpiryDetection_test.ts.
  *
  * V22 is deliberately NOT here. It is about the polling path reaching this module at all, and
@@ -63,7 +66,7 @@ describe('ConfigRecovery', () => {
     return { needsPushStub, activeHashesStub };
   }
 
-  /** across every batch: the delete now goes in its own, after the stores have run (§5.1, v70) */
+  /** across every batch: the delete goes in its own, after the stores have run */
   function allSubRequestsSent() {
     return sendStub.getCalls().flatMap(c => c.args[0].sortedSubRequests as Array<unknown>);
   }
@@ -209,7 +212,7 @@ describe('ConfigRecovery', () => {
     expect(sendStub.called).to.be.false;
   });
 
-  it('V13: a hash is re-stored once per session however many polls report it', async () => {
+  it('V13: a hash is re-stored ONCE however many polls report it, within the bar interval', async () => {
     stubWrappers();
     detectMissing([H2]);
     ConfigRecovery.markLocalStateLevelWithSwarm(us);
@@ -220,7 +223,9 @@ describe('ConfigRecovery', () => {
     detectMissing([H2]);
 
     expect(await ConfigRecovery.recoverIfNeeded(us), 'second poll must not re-store').to.be.false;
-    expect(sendStub.callCount, 'exactly one send for the session').to.be.eq(1);
+    // "one send" holds for the BAR INTERVAL, not the session — the clock does not move in this
+    // test, so the two are indistinguishable here and only V13g can tell them apart.
+    expect(sendStub.callCount, 'exactly one send while the bar holds').to.be.eq(1);
   });
 
   it('V13g: the bar EXPIRES — a barred hash is re-stored after the interval, same session', async () => {
@@ -228,7 +233,7 @@ describe('ConfigRecovery', () => {
     // pass on the session-scoped version too. That is the trap this vector exists for — a
     // session-scoped bar passes V13, V13a and V13b and fails only here.
     //
-    // Why it matters on Desktop specifically: §5.3 means there is no foreground gate, so a session
+    // Why it matters on Desktop specifically: there is no foreground gate, so a session
     // runs for weeks. "Never again this session" can outlive the 30-day TTL, and the hash the bar
     // is protecting can expire from the swarm a second time inside it.
     let fakeNow = 1_700_000_000_000;
@@ -255,7 +260,7 @@ describe('ConfigRecovery', () => {
 
   it('V13h: a config too big for one batch is SPLIT across batches, not skipped', async () => {
     // 25 parts against a limit of 20. Skipping would make a config over ~1.5MB permanently
-    // unrecoverable — the largest accounts, excluded by the fix written for them. §3.4 governs
+    // unrecoverable — the largest accounts, excluded by the fix written for them. The all-parts rule governs
     // when it counts as stored, not which transport the parts travel in.
     const many = Array.from({ length: 25 }, (_, i) => new Uint8Array([i]));
     stubWrappers({ activeHashes: ['P1'], parts: many, obsoleteHashes: ['old1'] });
@@ -265,7 +270,7 @@ describe('ConfigRecovery', () => {
     const ran = await ConfigRecovery.recoverIfNeeded(us);
 
     expect(ran, 'every part landed, across however many batches it took').to.be.true;
-    // 20 + 5 stores, then the delete in its own batch once they have all landed (§5.1, v70)
+    // 20 + 5 stores, then the delete in its own batch once they have all landed
     expect(sendStub.callCount, 'two store batches plus the delete').to.be.eq(3);
 
     const sizes = sendStub.getCalls().map(c => c.args[0].sortedSubRequests.length);
@@ -307,7 +312,7 @@ describe('ConfigRecovery', () => {
     expect(deleteRequest?.messageHashes).to.have.members(['oldhash1', 'oldhash2']);
   });
 
-  it('§5.1 (v70): no delete for a config whose store did NOT land', async () => {
+  it('no delete for a config whose store did NOT land', async () => {
     // Deleting an obsolete hash whose replacement failed to store removes the swarm's only older
     // copy — a seed restore in that window then gets nothing rather than something stale. Note the
     // pair below: the absence assertion alone would also pass against a delete path that was never
@@ -325,7 +330,7 @@ describe('ConfigRecovery', () => {
     expect(deleteRequestSent(), 'but its obsolete hash is left alone').to.be.undefined;
   });
 
-  it('§5.1 (v70) counterpart: the SAME fixture DOES delete once the store lands', async () => {
+  it('counterpart: the SAME fixture DOES delete once the store lands', async () => {
     stubWrappers({ obsoleteHashes: ['oldhash1'] });
     detectMissing([H2]);
     ConfigRecovery.markLocalStateLevelWithSwarm(us);
@@ -363,8 +368,8 @@ describe('ConfigRecovery', () => {
     expect(storeRequestsSent().length, 'all three parts go back').to.be.eq(3);
   });
 
-  it('§5.4: a half-landing multipart config resets the backoff — progress is not failure', async () => {
-    // The parts that stored are barred by §5.5, so the next round is strictly smaller: the swarm is
+  it('a half-landing multipart config resets the backoff — progress is not failure', async () => {
+    // The parts that stored are barred, so the next round is strictly smaller: the swarm is
     // converging and is demonstrably reachable. Backing off would penalise it for making progress.
     const fakeNow = 1_700_000_000_000; // deliberately not advanced: the reset is what lets it retry
     ConfigRecovery.setNowForTesting(() => fakeNow);
@@ -417,7 +422,7 @@ describe('ConfigRecovery', () => {
 
   it('V13a + V13b: a store whose SUB-RESPONSE failed is retried, though the batch returned 200', async () => {
     // Two vectors, one fixture, because they are two claims about the same situation:
-    //   V13a — the once-per-session bar keys on SUCCESS, not on attempt. Read as a pair with V13,
+    //   V13a — the bar keys on SUCCESS, not on attempt. Read as a pair with V13,
     //          which alone passes on a bars-on-attempt implementation; that is why that reading
     //          survived 39 spec revisions.
     //   V13b — "success" means every SUB-RESPONSE's own code, not that the outer batch returned.
@@ -440,7 +445,7 @@ describe('ConfigRecovery', () => {
     expect(await ConfigRecovery.recoverIfNeeded(us), 'a partial store is not a success').to.be
       .false;
 
-    // and §5.5 must not have banked it: a later poll gets another go, once the §5.4 backoff on the
+    // and it must not be banked as done: a later poll gets another go, once the backoff on the
     // failed attempt has elapsed
     fakeNow += 61 * 1000;
     sendStub.callsFake(async ({ sortedSubRequests }: any) =>
@@ -454,8 +459,8 @@ describe('ConfigRecovery', () => {
     ).to.be.true;
   });
 
-  it('§5.5 + V13c + V13d: a failing store is rate-limited, but NEVER permanently excluded', async () => {
-    // Release-without-bound is the re-push storm; a hard cap re-creates the exclusion §5.5 was
+  it('V13c + V13d: a failing store is rate-limited, but NEVER permanently excluded', async () => {
+    // Release-without-bound is the re-push storm; a hard cap re-creates the exclusion the rule was
     // corrected to remove (three transient failures would write the device off for a session that
     // can last days). So: rate-limited, never excluded. Asserts BOTH halves with exact counts.
     // a swappable clock rather than Sinon fake timers: faking global time deadlocks mocha, and
@@ -529,17 +534,21 @@ describe('ConfigRecovery', () => {
   });
 
   describe('groups', () => {
-    it('V12/V16: group swarms are not re-stored on Desktop', async () => {
+    it('a group whose details cannot be read is not recovered, and the poll survives it', async () => {
+      // This replaces a test asserting "group swarms are not re-stored on Desktop", which stopped
+      // being true when group recovery landed. It had kept passing — but only because this file
+      // never stubbed the group wrappers, so the lookup threw and the early return did the work.
+      // The stub below makes the throw deliberate instead of incidental; the real group vectors
+      // live in configRecoveryGroup_test.ts.
+      Sinon.stub(UserGroupsWrapperActions, 'getGroup').rejects(new Error('no such group'));
       const groupPk = TestUtils.generateFakeClosedGroupV2PkStr();
       ConfigRecovery.recordDetection(groupPk, { status: 'conclusive', missingHashes: [H2] });
       ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
 
       const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
 
-      // Desktop cannot reach the bytes of a clean group config (MetaGroupWrapper::push returns null
-      // unless needs_push()), so a kicked or destroyed group cannot be re-stored by construction.
-      expect(ran).to.be.false;
-      expect(sendStub.called).to.be.false;
+      expect(ran, 'nothing inspectable, so nothing to put back').to.be.false;
+      expect(sendStub.called, 'and nothing sent').to.be.false;
     });
   });
 });

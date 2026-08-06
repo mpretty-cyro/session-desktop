@@ -971,8 +971,15 @@ abstract class StoreGroupConfigSubRequest<
   public readonly destination: GroupPubkeyType;
   public readonly ttlMs: number;
   public readonly encryptedData: Uint8Array;
-  // this is mandatory for a group config store, if it is null, we throw
   public readonly secretKey: Uint8Array | null;
+  /**
+   * A member's subaccount auth, used when we have no admin `secretKey`.
+   *
+   * Only config RECOVERY takes this path: a member cannot change group config, so the normal push
+   * always has the admin key. But a member CAN put its own unmodified copy back after it expires
+   * from the swarm, and its subaccount token carries Read+Write for exactly that.
+   */
+  public readonly authData: Uint8Array | null;
 
   constructor(
     args: WithGroupPubkey &
@@ -980,6 +987,7 @@ abstract class StoreGroupConfigSubRequest<
         namespace: T;
         encryptedData: Uint8Array;
         secretKey: Uint8Array | null;
+        authData?: Uint8Array | null;
         ttlMs: number;
       }
   ) {
@@ -989,6 +997,7 @@ abstract class StoreGroupConfigSubRequest<
     this.ttlMs = args.ttlMs;
     this.encryptedData = args.encryptedData;
     this.secretKey = args.secretKey;
+    this.authData = args.authData ?? null;
 
     if (isEmpty(this.encryptedData)) {
       throw new Error('this.encryptedData cannot be empty');
@@ -996,8 +1005,10 @@ abstract class StoreGroupConfigSubRequest<
     if (!PubKey.is03Pubkey(this.destination)) {
       throw new Error('StoreGroupConfigSubRequest: group config namespace required a 03 pubkey');
     }
-    if (isEmpty(this.secretKey)) {
-      throw new Error('StoreGroupConfigSubRequest needs secretKey to be set');
+    // Either credential will do, but not neither: `getSnodeGroupSignature` prefers the admin key
+    // and falls back to the subaccount, and with both empty it cannot sign at all.
+    if (isEmpty(this.secretKey) && isEmpty(this.authData)) {
+      throw new Error('StoreGroupConfigSubRequest needs secretKey or authData to be set');
     }
   }
 
@@ -1011,7 +1022,7 @@ abstract class StoreGroupConfigSubRequest<
     const signDetails = await SnodeGroupSignature.getSnodeGroupSignature({
       method: this.method,
       namespace: this.namespace,
-      group: { authData: null, pubkeyHex: this.destination, secretKey: this.secretKey },
+      group: { authData: this.authData, pubkeyHex: this.destination, secretKey: this.secretKey },
     });
 
     if (!signDetails) {

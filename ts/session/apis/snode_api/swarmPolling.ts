@@ -117,7 +117,8 @@ function mergeMultipleRetrieveResults(
 /**
  * Whether every config namespace we polled actually answered.
  *
- * Guard §4.1 is about knowing the swarm state for the configs we are about to act on. A poll
+ * Being "level with the swarm" is about knowing the swarm state for the configs we are about to
+ * act on. A poll
  * fetches several namespaces at once and they can fail independently, so one namespace erroring
  * while the others answer leaves us ignorant about exactly its configs — a partial answer, not a
  * full one. We gate the whole swarm rather than the individual namespace: the spec allows either,
@@ -519,12 +520,19 @@ export class SwarmPolling {
       });
 
       // A snode answered and had nothing for us, so there is no config on the swarm we have yet to
-      // merge — which is exactly what guard §4.1 asks for. This is the path a device with expired
+      // merge — which is exactly what being level asks for. This is the path a device with expired
       // configs takes on every poll, so returning without considering recovery here would make the
       // whole feature a no-op for the devices it exists to repair.
       if (atLeastOneSnodeAnswered) {
         ConfigRecovery.markLocalStateLevelWithSwarm(pubkey);
-        await ConfigRecovery.recoverIfNeeded(pubkey);
+        // NOT awaited. A recovery round is up to 20 sub-requests per batch and possibly several
+        // batches, and this poll loop is shared by every other pubkey — holding it here delays their
+        // polls for a repair that is by design best-effort and can just as well finish after we
+        // return.
+        // The usual objection to `void` does not apply: recoverIfNeeded wraps its whole body in
+        // try/catch and logs, so it cannot produce an unhandled rejection. It also guards against
+        // overlapping rounds internally, which voiding it here is what makes necessary.
+        void ConfigRecovery.recoverIfNeeded(pubkey);
       }
       return;
     }
@@ -542,7 +550,8 @@ export class SwarmPolling {
       type,
     });
 
-    // Guard §4.1, evaluated in one place rather than inside the merge handler, because it depends
+    // The level-with-swarm decision, evaluated in one place rather than inside the merge handler,
+    // because it depends
     // on how the *poll* went and not on what the merge did.
     // Three ways to fail to be level, and they fail differently, which is why all three are
     // checked here rather than inferred from one another:
@@ -564,7 +573,8 @@ export class SwarmPolling {
       mergedEverythingFetched
     ) {
       ConfigRecovery.markLocalStateLevelWithSwarm(pubkey);
-      await ConfigRecovery.recoverIfNeeded(pubkey);
+      // not awaited — see the note on the other call site above
+      void ConfigRecovery.recoverIfNeeded(pubkey);
     }
 
     await this.handleRevokedMessages({ revokedMessages, groupPk: pubkey, type });

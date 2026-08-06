@@ -5,9 +5,9 @@ import { ExpireMessageResultItem, ExpireMessagesResultsContent } from './types';
  * Deciding whether a config message has expired from the swarm, from the response to the `expire`
  * request we piggyback on every poll.
  *
- * This is a normative rule shared with iOS and Android — see
- * `CONFIG_EXPIRY_DETECTION_SPEC.md`. The three clients each implement it separately, so if you
- * change the behaviour here it has to change there too. Every rule below has a test vector.
+ * This is a normative rule shared with iOS and Android. The three clients each implement it
+ * separately, so if you change the behaviour here it has to change there too. Every rule below has
+ * a test vector.
  */
 
 export type ConfigExpiryDetection =
@@ -67,9 +67,9 @@ export function detectMissingConfigHashes({
   if (isEmpty(requestedHashes)) {
     // We asked about nothing, so we learned nothing. The tempting short-circuit here is
     // "no hashes requested, therefore none are missing" — but reporting that as *conclusive* makes
-    // detection the authority for a swarm it has no information about, and under §3.5 a conclusive
-    // result outranks the empty-fetch check. That check is precisely the one that should decide
-    // when we hold no hashes, and it could then never be reached.
+    // detection the authority for a swarm it has no information about, and a conclusive result
+    // outranks the empty-fetch check. That check is precisely the one that should decide when we
+    // hold no hashes, and it could then never be reached.
     return { status: 'inconclusive' };
   }
 

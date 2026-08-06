@@ -1,4 +1,4 @@
-import { GroupPubkeyType } from 'libsession_util_nodejs';
+import { GroupPubkeyType, PubkeyType } from 'libsession_util_nodejs';
 import { isArray } from 'lodash';
 import { Snode } from '../../../data/types';
 import { SnodeNamespace, SnodeNamespaces, SnodeNamespacesGroup } from './namespaces';
@@ -171,7 +171,7 @@ async function buildRetrieveRequest(
 /**
  * Read the `expire` sub-response we piggyback on every poll to work out whether any of our config
  * messages have expired from the swarm, and record it. Acting on it happens after the merge, in
- * `swarmPolling` — see guard §4.1.
+ * `swarmPolling`, once we know our local state is level with the swarm.
  *
  * This only ever records; it must not throw into the polling path.
  */
@@ -181,7 +181,7 @@ function detectExpiredConfigs({
   expireSubRequest,
   expireResult,
 }: {
-  associatedWith: string;
+  associatedWith: PubkeyType | GroupPubkeyType;
   configHashesToBump: Array<string>;
   expireSubRequest: RetrieveSubRequestType | undefined;
   expireResult: BatchResultEntry;
@@ -301,7 +301,11 @@ async function retrieveNextMessagesNoRetries(
         window.log.warn(
           `the update expiry of our tracked config hashes didn't work: ${JSON.stringify(lastResult)}`
         );
-      } else {
+      } else if (PubKey.is03Pubkey(associatedWith) || PubKey.is05Pubkey(associatedWith)) {
+        // Narrowed with a real check rather than a cast. `associatedWith` is a `string` all the way
+        // down the poller, but recovery keys its per-swarm state on an ACCOUNT pubkey, and anything
+        // that is neither `03` nor `05` names no swarm we could recover — so skipping is right, not
+        // merely type-convenient.
         detectExpiredConfigs({
           associatedWith,
           configHashesToBump,
