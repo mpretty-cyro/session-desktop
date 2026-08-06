@@ -825,6 +825,17 @@ export class SwarmPolling {
             window.log.info(
               `no configs before and after fetch of group: ${ed25519Str(pubkey)} from snode ${ed25519Str(snodeEdkey)}, but another snode has config hash fetched already (${ed25519Str(swarmSnodes?.[swarmIndex]?.pubkey_ed25519)}). Group is not expired.`
             );
+          } else if (await ConfigRecovery.canRepairGroupKeys(pubkey)) {
+            // We hold the keys messages verbatim, so this is recoverable BY US: recovery will put
+            // them back on the next pass. Flagging expired here would tell the user the group is
+            // gone at the exact moment we are able to fix it.
+            //
+            // The verdict is DEFERRED behind bytes-held rather than merely corrected afterwards —
+            // setting the flag and clearing it a moment later is a visible flicker on a group that
+            // was never unrecoverable from this device.
+            window.log.info(
+              `no configs before and after fetch of group: ${ed25519Str(pubkey)}, but we retain its keys messages. Not flagging expired — recovery can repair it.`
+            );
           } else {
             // the group appears to be expired.
             window.log.warn(

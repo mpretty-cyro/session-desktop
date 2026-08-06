@@ -14,9 +14,11 @@ import { UserUtils } from '../../../../session/utils';
 import {
   DeleteHashesFromGroupNodeSubRequest,
   StoreGroupInfoSubRequest,
+  StoreGroupKeysSubRequest,
   StoreGroupMembersSubRequest,
 } from '../../../../session/apis/snode_api/SnodeRequestTypes';
 import { TestUtils } from '../../../test-utils';
+import { ConvoHub } from '../../../../session/conversations';
 
 const { expect } = chai;
 
@@ -25,8 +27,8 @@ const { expect } = chai;
  * `pushForRecovery()` and `activeHashesByConfig()`: V16, V16a, V16b, V19, V20, V21.
  *
  * The user-path vectors are in configRecovery_test.ts and are NOT repeated here. What is specific
- * to groups is: which sub-config a hash belongs to (GroupKeys cannot be put back), and whether we
- * are an admin or a member (a member cannot delete).
+ * to groups is: which sub-config a hash belongs to (GroupKeys goes back only from retained bytes,
+ * verbatim), and whether we are an admin or a member (a member cannot delete).
  *
  * ON "ASSERTS THAT X DOES NOT HAPPEN" TESTS — same rule as the user file. Every absence assertion
  * below is also satisfied by the path dying early, so each carries something proving it reached the
@@ -57,6 +59,7 @@ describe('ConfigRecovery (groups)', () => {
     memberParts = [new Uint8Array([2])],
     infoObsolete = [] as Array<string>,
     memberObsolete = [] as Array<string>,
+    retainedKeyMessages = {} as Record<string, Uint8Array>,
   } = {}) {
     Sinon.stub(UserGroupsWrapperActions, 'getGroup').resolves({
       pubkeyHex: groupPk,
@@ -73,6 +76,10 @@ describe('ConfigRecovery (groups)', () => {
       groupMember: memberHashes,
       groupKeys: keysHashes,
     });
+    // ⚠️ Must be stubbed even for tests that are not about keys. Without it the call throws, the
+    // inspection reports "could not inspect" and every keys assertion below passes through the
+    // error path instead of the rule it names.
+    Sinon.stub(MetaGroupWrapperActions, 'activeKeyMessages').resolves(retainedKeyMessages);
     Sinon.stub(MetaGroupWrapperActions, 'pushForRecovery').resolves({
       groupInfo: { data: infoParts, seqno: 5, hashes: infoObsolete, namespace: 12 },
       groupMember: { data: memberParts, seqno: 5, hashes: memberObsolete, namespace: 13 },
@@ -89,6 +96,12 @@ describe('ConfigRecovery (groups)', () => {
 
   function memberStoresSent() {
     return allSubRequestsSent().filter(r => r instanceof StoreGroupMembersSubRequest);
+  }
+
+  function keysStoresSent() {
+    return allSubRequestsSent().filter(
+      (r): r is StoreGroupKeysSubRequest => r instanceof StoreGroupKeysSubRequest
+    );
   }
 
   function deleteRequestSent() {
@@ -139,8 +152,9 @@ describe('ConfigRecovery (groups)', () => {
   });
 
   it('V16a: one GroupKeys hash missing while another is PRESENT — no re-store, group not expired', async () => {
-    // Read with V16 below: a keys hash cannot be put back by anyone but an admin rekey, so the
-    // correct behaviour is to report and settle, NOT to attempt a store that would fail.
+    // ⚠️ The reason here CHANGED. It used to be "a keys message can never be put back". It now is
+    // "we retain no bytes for it" — this fixture holds none. A device that does hold them re-stores
+    // instead, which is V23. Kept as the no-bytes case because groups predating retention are real.
     stubGroup({ keysHashes: [KEYS_HASH, 'keyshash2'] });
     detectMissing([KEYS_HASH]);
     ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
@@ -148,19 +162,95 @@ describe('ConfigRecovery (groups)', () => {
     const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
 
     expect(ran, 'nothing was restorable').to.be.false;
-    expect(sendStub.called, 'and crucially nothing was SENT — a keys message cannot be re-emitted')
-      .to.be.false;
+    expect(sendStub.called, 'and nothing was SENT — this fixture retains no bytes to send').to.be
+      .false;
   });
 
-  it('V16: EVERY GroupKeys hash missing — still no re-store attempted', async () => {
-    stubGroup();
+  it('V16/V23a: EVERY GroupKeys hash missing and NO retained bytes — no re-store attempted', async () => {
+    // The group predates keys retention, so there is nothing to push back. Unchanged behaviour, but
+    // note the reason: not "impossible to recover" — "not recoverable BY THIS DEVICE". A peer that
+    // holds the bytes can still repair it.
+    stubGroup({ retainedKeyMessages: {} });
     detectMissing([KEYS_HASH]);
     ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
 
     const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
 
     expect(ran).to.be.false;
-    expect(sendStub.called, 'no store for a config that cannot be re-emitted').to.be.false;
+    expect(sendStub.called, 'nothing held, so nothing to send').to.be.false;
+  });
+
+  it('V23: every GroupKeys hash missing but the bytes ARE held — re-store them', async () => {
+    // The vector pins BYTES-HELD as the term, not the missing-ness: V23a has the identical missing
+    // set and does nothing. The only difference between them is the retained map.
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9, 9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(ran, 'a member CAN put keys back, because it pushes the bytes verbatim').to.be.true;
+    expect(keysStoresSent().length, 'the keys message went out').to.be.eq(1);
+    expect(
+      keysStoresSent()[0].encryptedData,
+      'and VERBATIM — re-signing is impossible, so any transformation breaks it'
+    ).to.deep.eq(new Uint8Array([9, 9]));
+  });
+
+  it('V23 (member): a non-admin with retained bytes repairs the keys', async () => {
+    // The point of the whole change. A member cannot sign a keys message, so this only works
+    // because the bytes are pushed back unchanged.
+    stubGroup({
+      secretKey: null,
+      authData: new Uint8Array(100).fill(3),
+      retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) },
+    });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    expect(await ConfigRecovery.recoverIfNeeded(groupPk)).to.be.true;
+    expect(keysStoresSent().length).to.be.eq(1);
+    expect(deleteRequestSent(), 'a keys message supersedes nothing, so no delete ever').to.be
+      .undefined;
+  });
+
+  it('V23b: a supplemental is retained and re-stored too, not dropped', async () => {
+    // Storage is hash-keyed, not generation-keyed, and a generation is the full rekey PLUS every
+    // supplemental issued against it — a member receiving only one of them does not get the key.
+    // We cannot group by generation (the accessor carries none), so EVERY retained message goes
+    // back. That is a superset of the affected generation, which is what the rule protects.
+    stubGroup({
+      keysHashes: [KEYS_HASH, 'supplemental1'],
+      retainedKeyMessages: {
+        [KEYS_HASH]: new Uint8Array([1]),
+        supplemental1: new Uint8Array([2]),
+      },
+    });
+    detectMissing([KEYS_HASH]); // only ONE reported missing
+
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(
+      keysStoresSent().length,
+      'both go back though only one was missing — a partial generation is unusable'
+    ).to.be.eq(2);
+  });
+
+  it('V23c: a FAILED keys re-store is not banked as success', async () => {
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+    sendStub.callsFake(async ({ sortedSubRequests }: any) =>
+      sortedSubRequests.map(() => ({ code: 500, body: {} }))
+    );
+
+    const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(ran, 'a 500 is not a repair').to.be.false;
+    expect(keysStoresSent().length, 'but it was attempted — this is not an early return').to.be.eq(
+      1
+    );
   });
 
   it('V16b: the device holds NO GroupKeys hashes at all, so no keys question was asked', async () => {
@@ -248,6 +338,64 @@ describe('ConfigRecovery (groups)', () => {
       deleteRequestSent()?.messageHashes,
       'the admin prunes what it superseded'
     ).to.have.members(['oldinfo1']);
+  });
+
+  it('V23d: a successful keys re-store CLEARS an existing expired flag, eagerly', async () => {
+    // Not left to the poller's reactive clear. That fires when config messages are RECEIVED — but
+    // we just re-stored messages we already hold, so we may never receive or re-handle them, and
+    // the flag would sit set forever over keys that are back on the swarm.
+    const setExpired = Sinon.stub();
+    const commit = Sinon.stub().resolves();
+    Sinon.stub(ConvoHub, 'use').returns({
+      get: () => ({ getIsExpired03Group: () => true, setIsExpired03Group: setExpired, commit }),
+    } as any);
+
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(keysStoresSent().length, 'the re-store happened').to.be.eq(1);
+    expect(setExpired.calledOnceWith(false), 'and the flag was cleared by it').to.be.true;
+    expect(commit.called, 'and persisted').to.be.true;
+  });
+
+  it('V23d counterpart: a FAILED keys re-store leaves the expired flag alone', async () => {
+    // The reachability control for the assertion above: without it, "cleared" would also pass
+    // against an implementation that cleared the flag unconditionally on every attempt.
+    const setExpired = Sinon.stub();
+    Sinon.stub(ConvoHub, 'use').returns({
+      get: () => ({
+        getIsExpired03Group: () => true,
+        setIsExpired03Group: setExpired,
+        commit: Sinon.stub().resolves(),
+      }),
+    } as any);
+
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+    sendStub.callsFake(async ({ sortedSubRequests }: any) =>
+      sortedSubRequests.map(() => ({ code: 500, body: {} }))
+    );
+
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(keysStoresSent().length, 'it was attempted').to.be.eq(1);
+    expect(setExpired.called, 'but nothing landed, so the group is still expired').to.be.false;
+  });
+
+  it('canRepairGroupKeys: true only when bytes are actually held', async () => {
+    // What the poller asks before flagging a group expired. The flag means "not recoverable by this
+    // device", so holding the bytes must defer it rather than raise-then-clear.
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    expect(await ConfigRecovery.canRepairGroupKeys(groupPk)).to.be.true;
+    Sinon.restore();
+
+    TestUtils.stubWindowLog();
+    stubGroup({ retainedKeyMessages: {} });
+    expect(await ConfigRecovery.canRepairGroupKeys(groupPk)).to.be.false;
   });
 
   it('a KICKED group is not re-stored', async () => {

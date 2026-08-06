@@ -19,16 +19,21 @@ import {
   DeleteHashesFromUserNodeSubRequest,
   MAX_SUBREQUESTS_COUNT,
   StoreGroupInfoSubRequest,
+  StoreGroupKeysSubRequest,
   StoreGroupMembersSubRequest,
   StoreUserConfigSubRequest,
 } from './SnodeRequestTypes';
 import { ConfigExpiryDetection } from './configExpiryDetection';
 import { ed25519Str } from '../../utils/String';
 import { PubKey } from '../../types';
+import { ConvoHub } from '../../conversations';
 
 type SnodeSubRequestForRecovery = StoreUserConfigSubRequest | DeleteHashesFromUserNodeSubRequest;
 
-type StoreGroupConfigSubRequestForRecovery = StoreGroupInfoSubRequest | StoreGroupMembersSubRequest;
+type StoreGroupConfigSubRequestForRecovery =
+  | StoreGroupInfoSubRequest
+  | StoreGroupMembersSubRequest
+  | StoreGroupKeysSubRequest;
 type GroupSubRequestForRecovery =
   | StoreGroupConfigSubRequestForRecovery
   | DeleteHashesFromGroupNodeSubRequest;
@@ -55,8 +60,11 @@ type AccountPubkey = PubkeyType | GroupPubkeyType;
  * late as possible.
  *
  * Three things about the group path are easy to mistake for bugs:
- *   - `GroupKeys` is detect-only. A keys message cannot be re-emitted; only an admin rekey produces
- *     a new one. A missing keys hash is reported and settled, never retried.
+ *   - `GroupKeys` is recoverable ONLY from retained bytes. A keys message is admin-signed and its
+ *     padding derives from the group secret key, so nobody can regenerate one — but bytes already
+ *     held push back verbatim and land on the same hash, which is what lets a MEMBER repair a
+ *     group's keys. Where no bytes are held it is unrecoverable BY THIS DEVICE and settles; another
+ *     peer holding them can still put them back.
  *   - a MEMBER gets an empty obsolete-hash list. `push()` hands the superseded hashes back only
  *     `if (!is_readonly())` while clearing them either way (`base.cpp:809-813`), so empty is the
  *     expected result rather than a sign anything failed.
@@ -459,15 +467,17 @@ async function restoreUserConfigs(
   return { stored: fullyLanded.length === restores.length, anyPartLanded };
 }
 
-/** the two group sub-configs recovery can put back. GroupKeys is deliberately absent — see below. */
-type RestorableGroupConfig = 'groupInfo' | 'groupMember';
+/** the group sub-configs recovery can put back */
+type RestorableGroupConfig = 'groupInfo' | 'groupMember' | 'groupKeys';
 
 /**
  * Which of a group's sub-configs claim one of the missing hashes.
  *
- * GroupKeys is inspected but never restorable. A keys message cannot be re-emitted — only an admin
- * rekey produces a new one — so a missing keys hash is reported and left alone rather than being
- * treated as a failure to repair. That limit is the same on all three clients.
+ * GroupKeys is restorable only if we RETAINED ITS BYTES. A keys message is admin-signed and padded
+ * from the group secret key, so nobody can regenerate one — but bytes already held can be pushed
+ * back verbatim and land on the same hash, which is what lets a MEMBER repair a group's keys rather
+ * than only an admin. Where we hold no bytes (a message loaded before the wrapper retained them),
+ * it is unrecoverable by this device and settles, exactly as before.
  */
 async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashes: Array<string>) {
   const needingRestore: Array<RestorableGroupConfig> = [];
@@ -496,12 +506,19 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
 
     const missingKeysHashes = byConfig.groupKeys.filter(hash => missingHashes.includes(hash));
     if (missingKeysHashes.length) {
-      // Counted as COVERED so it settles rather than being re-examined on every poll forever. It is
-      // not an un-attempted restore; it is a restore that can never exist.
-      missingKeysHashes.forEach(hash => coveredHashes.add(hash));
-      window.log.warn(
-        `ConfigRecovery: ${missingKeysHashes.length} GroupKeys hash(es) missing for ${ed25519Str(groupPk)} — only an admin rekey can replace those`
-      );
+      const retained = await MetaGroupWrapperActions.activeKeyMessages(groupPk);
+
+      if (isEmpty(retained)) {
+        // Unrecoverable BY THIS DEVICE rather than unrecoverable: another peer holding the bytes can
+        // still put them back. Covered so it settles instead of being re-examined every poll.
+        missingKeysHashes.forEach(hash => coveredHashes.add(hash));
+        window.log.warn(
+          `ConfigRecovery: ${missingKeysHashes.length} GroupKeys hash(es) missing for ${ed25519Str(groupPk)} and no retained bytes — cannot repair from here`
+        );
+      } else {
+        needingRestore.push('groupKeys');
+        missingKeysHashes.forEach(hash => coveredHashes.add(hash));
+      }
     }
 
     (['groupInfo', 'groupMember'] as const).forEach(config => {
@@ -537,40 +554,72 @@ async function restoreGroupConfigs(
     return { stored: false, anyPartLanded: false };
   }
 
-  // `pushForRecovery` ignores needs_push() and hands back groupInfo and groupMember only — there is
-  // no groupKeys key on the result at all, so the unrestorable config cannot be sent by accident.
+  const needsPushed = configs.some(c => c !== 'groupKeys');
+
+  // `pushForRecovery` ignores needs_push() and hands back groupInfo and groupMember only. Keys are
+  // NOT in it and cannot be: it re-serialises current state, and a keys message is admin-signed
+  // with padding derived from the group secret key, so a member could not produce a valid one.
   //
   // ⚠️ It DRAINS the obsolete-hash list despite reading like a query, because it calls push()
-  // underneath. So this is the only time we will see those hashes, exactly as on the user path.
-  const pushed = await MetaGroupWrapperActions.pushForRecovery(groupPk);
+  // underneath. So this is the only time we will see those hashes — and it is why it is only called
+  // when a config that needs it is actually being restored.
+  const pushed = needsPushed ? await MetaGroupWrapperActions.pushForRecovery(groupPk) : null;
 
   const byConfig = await MetaGroupWrapperActions.activeHashesByConfig(groupPk);
 
-  const restores = configs.map(config => ({
-    config,
-    // Every part goes back again here, not just the parts reported missing.
-    stores: pushed[config].data.map(ciphertext =>
-      config === 'groupInfo'
-        ? new StoreGroupInfoSubRequest({
-            encryptedData: ciphertext,
-            groupPk,
-            secretKey: group.secretKey,
-            authData: group.authData,
-            ttlMs: TTL_DEFAULT.CONFIG_MESSAGE,
-            getNow: NetworkTime.now,
-          })
-        : new StoreGroupMembersSubRequest({
-            encryptedData: ciphertext,
-            groupPk,
-            secretKey: group.secretKey,
-            authData: group.authData,
-            ttlMs: TTL_DEFAULT.CONFIG_MESSAGE,
-            getNow: NetworkTime.now,
-          })
-    ),
-    obsoleteHashes: pushed[config].hashes,
-    activeHashes: byConfig[config],
-  }));
+  // Keys come from retained BYTES rather than from a re-serialise — that is the whole mechanism.
+  //
+  // ⚠️ ALL retained messages go back, not only the ones reported missing. A generation is the full
+  // rekey plus every supplemental issued against it, and a member who receives only part of a
+  // generation does not get the key — so a partial re-store can leave the group unreadable for
+  // someone. Re-storing everything is a superset of "every message of the affected generation",
+  // which is what the rule requires; the extras are byte-identical no-op TTL refreshes.
+  // (The accessor is keyed by hash and carries no generation, so grouping by generation is not
+  // expressible here. Re-storing all of them is correct regardless of how they group.)
+  const keyMessages = configs.includes('groupKeys')
+    ? await MetaGroupWrapperActions.activeKeyMessages(groupPk)
+    : {};
+
+  const storeArgs = {
+    groupPk,
+    secretKey: group.secretKey,
+    authData: group.authData,
+    ttlMs: TTL_DEFAULT.CONFIG_MESSAGE,
+    getNow: NetworkTime.now,
+  };
+
+  type GroupRestore = {
+    config: RestorableGroupConfig;
+    stores: Array<StoreGroupConfigSubRequestForRecovery>;
+    obsoleteHashes: Array<string>;
+    activeHashes: Array<string>;
+  };
+
+  const restores: Array<GroupRestore> = configs.map((config): GroupRestore => {
+    if (config === 'groupKeys') {
+      return {
+        config,
+        stores: Object.values(keyMessages).map(
+          encryptedData => new StoreGroupKeysSubRequest({ ...storeArgs, encryptedData })
+        ),
+        // a keys message supersedes nothing, so there is never anything to prune here
+        obsoleteHashes: [] as Array<string>,
+        activeHashes: Object.keys(keyMessages),
+      };
+    }
+
+    return {
+      config,
+      // Every part goes back again here, not just the parts reported missing.
+      stores: (pushed?.[config].data ?? []).map(encryptedData =>
+        config === 'groupInfo'
+          ? new StoreGroupInfoSubRequest({ ...storeArgs, encryptedData })
+          : new StoreGroupMembersSubRequest({ ...storeArgs, encryptedData })
+      ),
+      obsoleteHashes: pushed?.[config].hashes ?? [],
+      activeHashes: byConfig[config],
+    };
+  });
 
   const allStores = restores.flatMap(r => r.stores);
   if (!allStores.length) {
@@ -603,7 +652,8 @@ async function restoreGroupConfigs(
     batch.forEach((request, i) => {
       if (
         request instanceof StoreGroupInfoSubRequest ||
-        request instanceof StoreGroupMembersSubRequest
+        request instanceof StoreGroupMembersSubRequest ||
+        request instanceof StoreGroupKeysSubRequest
       ) {
         landed.set(request, result[i].code === 200);
       }
@@ -649,6 +699,28 @@ async function restoreGroupConfigs(
   }
 
   fullyLanded.forEach(r => r.activeHashes.forEach(hash => hashSettledAt.set(hash, nowMs())));
+
+  // A landed keys re-store clears an existing expired flag EAGERLY rather than leaving it to the
+  // poller's reactive clear. That path fires when config messages are received — but we just
+  // re-stored messages we already hold, so we may never receive or re-handle them, and the flag
+  // would stay set forever over keys that are back on the swarm.
+  if (fullyLanded.some(r => r.config === 'groupKeys')) {
+    try {
+      const convo = ConvoHub.use().get(groupPk);
+      if (convo?.getIsExpired03Group()) {
+        window.log.info(
+          `ConfigRecovery: keys restored for ${ed25519Str(groupPk)} — clearing its expired flag`
+        );
+        convo.setIsExpired03Group(false);
+        await convo.commit();
+      }
+    } catch (e) {
+      // best-effort: the repair itself succeeded, and the reactive path may still clear it
+      window.log.warn(
+        `ConfigRecovery: could not clear expired flag for ${ed25519Str(groupPk)}: ${e.message}`
+      );
+    }
+  }
 
   if (fullyLanded.length) {
     // pushForRecovery mutated the wrapper (it drained the obsolete hashes), so that has to persist
@@ -796,6 +868,26 @@ function resetForTesting() {
 }
 
 /**
+ * Do we hold the bytes to put this group's keys messages back ourselves?
+ *
+ * The poller asks before flagging a group expired. "Expired" means not recoverable BY THIS DEVICE,
+ * so a device retaining the keys messages must not raise it — it is about to repair the group.
+ *
+ * Deliberately tolerant: any failure to answer returns false, which keeps the existing behaviour
+ * rather than suppressing a flag we cannot justify suppressing.
+ */
+async function canRepairGroupKeys(groupPk: GroupPubkeyType) {
+  try {
+    return !isEmpty(await MetaGroupWrapperActions.activeKeyMessages(groupPk));
+  } catch (e) {
+    window.log.warn(
+      `ConfigRecovery: canRepairGroupKeys failed for ${ed25519Str(groupPk)}: ${e.message}`
+    );
+    return false;
+  }
+}
+
+/**
  * Exported for tests only. The poller does not await recovery, so a test that drives a poll has to
  * be able to wait for the round it started; without this it would have to sleep and hope.
  * Resolves immediately when no round is running.
@@ -818,6 +910,7 @@ export const ConfigRecovery = {
   recordDetection,
   getMissingHashes,
   recoverIfNeeded,
+  canRepairGroupKeys,
   resetForTesting,
   waitForRecoveryForTesting,
 };
