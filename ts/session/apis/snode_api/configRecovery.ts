@@ -255,11 +255,13 @@ function recordDetection(pubkey: AccountPubkey, detection: ConfigExpiryDetection
   }
 
   if (!detection.missingHashes.length) {
-    // Deliberately NOT clearing what earlier polls recorded. A hash that was successfully re-stored
-    // is already filtered out by hashSettledAt, and one whose store FAILED is exactly
-    // the thing we want a later poll to retry — bounded by MAX_RECOVERY_ROUNDS_PER_SWARM rather
-    // than by forgetting it. So a clearing step could only ever destroy findings, including on a
-    // wrongly-conclusive result, without ever preventing a redundant re-store.
+    // Deliberately NOT clearing what earlier polls recorded. A hash whose store FAILED is exactly
+    // the thing we want a later poll to retry, and forgetting it is not how that retry is bounded —
+    // the backoff is. (This used to cite MAX_RECOVERY_ROUNDS_PER_SWARM, which was replaced by the
+    // backoff and no longer exists; the behaviour was right, the stated reason was not.)
+    // So a clearing step here could only destroy findings, including on a wrongly-conclusive
+    // result, without ever preventing a redundant re-store. Hashes are dropped once SETTLED
+    // instead — see pruneSettledDetections.
     return;
   }
 
@@ -276,6 +278,31 @@ function recordDetection(pubkey: AccountPubkey, detection: ConfigExpiryDetection
  * is exactly the population the time-bound was added for, so the leak would target the same people
  * as the defect it fixes.
  */
+/**
+ * Drop detections we have finished with, so the accumulator cannot grow for the life of the process.
+ *
+ * Same leak `pruneExpiredBars` was written for, one map over and against the same population: hashes
+ * rotate on every re-push, and a Desktop session runs for days by design, so every superseded hash
+ * would otherwise be retained forever.
+ *
+ * Only settled hashes are dropped. A hash still awaiting a retry must stay, or the retry never
+ * happens — this prunes what is done with, never what is outstanding.
+ */
+function pruneSettledDetections(pubkey: AccountPubkey) {
+  const known = missingHashesByPubkey.get(pubkey);
+  if (!known) {
+    return;
+  }
+  known.forEach(hash => {
+    if (hashSettledAt.has(hash)) {
+      known.delete(hash);
+    }
+  });
+  if (!known.size) {
+    missingHashesByPubkey.delete(pubkey);
+  }
+}
+
 function pruneExpiredBars() {
   const now = nowMs();
   hashSettledAt.forEach((settledAt, hash) => {
@@ -335,14 +362,22 @@ async function userVariantsNeedingRestore(missingHashes: Array<string>) {
 /**
  * @returns `stored` — every part of every config landed, which is what bars a hash from retry (
  * a multipart config counts as stored only when all its parts do).
- * @returns `anyPartLanded` — at least one store sub-request came back 200. Deliberately separate:
- * a multipart config that repeatedly half-lands is making PROGRESS, not failing, because the parts
- * that stored are barred and the next round is strictly smaller. Backing off there would penalise a
- * swarm for converging, on a swarm we can demonstrably reach.
+ * @returns `progressed` — at least one config landed IN FULL, so its hashes are now barred and the
+ * next round is strictly smaller. Deliberately separate from `stored`: a swarm where one of several
+ * configs succeeded is converging, and backing off would penalise it for that.
+ *
+ * ⚠️ This was once `anyPartLanded` — "any sub-request returned 200" — and that was a re-push storm.
+ * Every part of a multipart config goes back on every attempt, so a config whose parts half-land
+ * sends the IDENTICAL request next round. One part that always succeeds beside one that always
+ * fails then reset the counter forever: nothing barred, `backoffMsFor(0)` is 0, full re-send on
+ * every poll. Measured at 10 rounds / 10 sends / 0 barred before the fix.
+ *
+ * The question is not "did anything land" but "did anything become BARRED" — only the second makes
+ * the next round smaller, and only the second is progress.
  */
 async function restoreUserConfigs(
   variants: Array<ConfigWrapperUser>
-): Promise<{ stored: boolean; anyPartLanded: boolean }> {
+): Promise<{ stored: boolean; progressed: boolean }> {
   const us = UserUtils.getOurPubKeyStrFromCache() as PubkeyType;
 
   /** one entry per config we are putting back, so success can be attributed per config */
@@ -381,7 +416,7 @@ async function restoreUserConfigs(
 
   const allStores = restores.flatMap(r => r.stores);
   if (!allStores.length) {
-    return { stored: false, anyPartLanded: false };
+    return { stored: false, progressed: false };
   }
 
   // The batch endpoint takes at most MAX_SUBREQUESTS_COUNT sub-requests INCLUSIVE, and an oversized
@@ -440,7 +475,7 @@ async function restoreUserConfigs(
   }
 
   const fullyLanded = restores.filter(r => r.stores.every(store => landed.get(store) === true));
-  const anyPartLanded = [...landed.values()].some(Boolean);
+  const progressed = fullyLanded.length > 0;
 
   // The delete covers only the configs that FULLY landed. An obsolete hash whose
   // replacement did not store is the swarm's only older copy of that config — deleting it would
@@ -464,7 +499,7 @@ async function restoreUserConfigs(
     await LibSessionUtil.saveDumpsToDb(us);
   }
 
-  return { stored: fullyLanded.length === restores.length, anyPartLanded };
+  return { stored: fullyLanded.length === restores.length, progressed };
 }
 
 /** the group sub-configs recovery can put back */
@@ -482,6 +517,8 @@ type RestorableGroupConfig = 'groupInfo' | 'groupMember' | 'groupKeys';
 async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashes: Array<string>) {
   const needingRestore: Array<RestorableGroupConfig> = [];
   const coveredHashes = new Set<string>();
+  /** every keys hash gone AND we hold no bytes — the group is expired as far as this device goes */
+  let keysUnrecoverableHere = false;
 
   try {
     const group = await UserGroupsWrapperActions.getGroup(groupPk);
@@ -490,14 +527,17 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
     // nothing to put back. Note both flags: `kicked` is false when the group was `destroyed`, so
     // checking one alone silently misses the other population.
     if (!group || group.kicked || group.destroyed) {
-      return { needingRestore, coveredHashes, inspectedEverything: true };
+      return { needingRestore, coveredHashes, inspectedEverything: true, keysUnrecoverableHere };
     }
 
-    // Clean configs only. A group with pending changes is about to be pushed by GroupSync
-    // under new hashes, which supersedes anything we would put back.
-    if (await MetaGroupWrapperActions.needsPush(groupPk)) {
-      return { needingRestore, coveredHashes, inspectedEverything: true };
-    }
+    // Clean configs only — but ⚠️ this gate does NOT apply to GroupKeys (ruling v139).
+    //
+    // The gate exists so local state cannot overwrite newer remote state. Keys recovery replays the
+    // exact bytes the swarm already had — byte-identical, same hash — so it cannot overwrite
+    // anything, and a pending rekey produces a NEW message at a NEW generation, which says nothing
+    // about whether the retained ones are stale. Gating keys on a dirty groupInfo would be a
+    // correlated exclusion: a group with pending changes is exactly a group in active use.
+    const dirty = await MetaGroupWrapperActions.needsPush(groupPk);
 
     // Only hashes the wrapper still considers active. Per-config, because the answer differs
     // per config: `activeHashes()` merges all three and cannot tell a restorable groupInfo hash
@@ -505,6 +545,13 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
     const byConfig = await MetaGroupWrapperActions.activeHashesByConfig(groupPk);
 
     const missingKeysHashes = byConfig.groupKeys.filter(hash => missingHashes.includes(hash));
+
+    // EVERY keys hash we asked about is gone. That — and only that — is what decides an expired
+    // group: one surviving keys hash still lets a new device in, which is why a partial miss is not
+    // expired.
+    const allKeysMissing =
+      byConfig.groupKeys.length > 0 && missingKeysHashes.length === byConfig.groupKeys.length;
+
     if (missingKeysHashes.length) {
       const retained = await MetaGroupWrapperActions.activeKeyMessages(groupPk);
 
@@ -512,6 +559,7 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
         // Unrecoverable BY THIS DEVICE rather than unrecoverable: another peer holding the bytes can
         // still put them back. Covered so it settles instead of being re-examined every poll.
         missingKeysHashes.forEach(hash => coveredHashes.add(hash));
+        keysUnrecoverableHere = allKeysMissing;
         window.log.warn(
           `ConfigRecovery: ${missingKeysHashes.length} GroupKeys hash(es) missing for ${ed25519Str(groupPk)} and no retained bytes — cannot repair from here`
         );
@@ -521,21 +569,28 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
       }
     }
 
-    (['groupInfo', 'groupMember'] as const).forEach(config => {
-      const claimed = byConfig[config].filter(hash => missingHashes.includes(hash));
-      if (claimed.length) {
-        needingRestore.push(config);
-        claimed.forEach(hash => coveredHashes.add(hash));
-      }
-    });
+    if (!dirty) {
+      (['groupInfo', 'groupMember'] as const).forEach(config => {
+        const claimed = byConfig[config].filter(hash => missingHashes.includes(hash));
+        if (claimed.length) {
+          needingRestore.push(config);
+          claimed.forEach(hash => coveredHashes.add(hash));
+        }
+      });
+    }
 
-    return { needingRestore, coveredHashes, inspectedEverything: true };
+    return { needingRestore, coveredHashes, inspectedEverything: true, keysUnrecoverableHere };
   } catch (e) {
     // as on the user path: a throw is not a guard verdict, so nothing settles on this pass
     window.log.warn(
       `ConfigRecovery: could not inspect group ${ed25519Str(groupPk)}: ${e.message}. Skipping it.`
     );
-    return { needingRestore: [], coveredHashes, inspectedEverything: false };
+    return {
+      needingRestore: [],
+      coveredHashes,
+      inspectedEverything: false,
+      keysUnrecoverableHere: false,
+    };
   }
 }
 
@@ -543,15 +598,15 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
  * Put a group's clean `groupInfo`/`groupMember` configs back on its swarm.
  *
  * Returns the same pair as the user path — see `restoreUserConfigs` for what `stored` and
- * `anyPartLanded` mean and why they are separate.
+ * `progressed` mean and why they are separate.
  */
 async function restoreGroupConfigs(
   groupPk: GroupPubkeyType,
   configs: Array<RestorableGroupConfig>
-): Promise<{ stored: boolean; anyPartLanded: boolean }> {
+): Promise<{ stored: boolean; progressed: boolean }> {
   const group = await UserGroupsWrapperActions.getGroup(groupPk);
   if (!group) {
-    return { stored: false, anyPartLanded: false };
+    return { stored: false, progressed: false };
   }
 
   const needsPushed = configs.some(c => c !== 'groupKeys');
@@ -623,7 +678,7 @@ async function restoreGroupConfigs(
 
   const allStores = restores.flatMap(r => r.stores);
   if (!allStores.length) {
-    return { stored: false, anyPartLanded: false };
+    return { stored: false, progressed: false };
   }
 
   const landed = new Map<StoreGroupConfigSubRequestForRecovery, boolean>();
@@ -675,7 +730,7 @@ async function restoreGroupConfigs(
   }
 
   const fullyLanded = restores.filter(r => r.stores.every(store => landed.get(store) === true));
-  const anyPartLanded = [...landed.values()].some(Boolean);
+  const progressed = fullyLanded.length > 0;
 
   // Same sweep rule as the user path, but note what it means for a MEMBER, because it looks like a
   // bug from either side:
@@ -727,7 +782,7 @@ async function restoreGroupConfigs(
     await LibSessionUtil.saveDumpsToDb(groupPk);
   }
 
-  return { stored: fullyLanded.length === restores.length, anyPartLanded };
+  return { stored: fullyLanded.length === restores.length, progressed };
 }
 
 /**
@@ -785,6 +840,12 @@ async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
       }
     );
 
+    // ⚠️ ORDER MATTERS, and it is the only reason this works. `pruneSettledDetections` reads
+    // `hashSettledAt` to decide what is finished with; `pruneExpiredBars` removes entries from it.
+    // Run the other way round, a bar that has just expired takes its hash out of `hashSettledAt`
+    // first, the detection then looks unfinished, and it is retained forever — the leak survives
+    // with both pruners present and looking correct.
+    pruneSettledDetections(pubkey);
     pruneExpiredBars();
 
     if (isEmpty(missingHashes)) {
@@ -797,6 +858,13 @@ async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
       ? await userVariantsNeedingRestore(missingHashes)
       : await groupConfigsNeedingRestore(pubkey as GroupPubkeyType, missingHashes);
     const { needingRestore, coveredHashes, inspectedEverything } = inspection;
+
+    // Every keys hash gone and no bytes held: nothing here can repair it, so raise the banner. This
+    // is the only place it is raised from detection — the poller's empty-fetch branch cannot see
+    // this case at all, because it requires holding NO config hashes and we hold plenty.
+    if (!isUs && 'keysUnrecoverableHere' in inspection && inspection.keysUnrecoverableHere) {
+      await setGroupExpired(pubkey as GroupPubkeyType, true);
+    }
 
     // "not stored" is three outcomes, not two. A hash no restorable config claims was ruled out by a
     // guard — not active any more, or belonging to a dirty config that will be pushed under a new
@@ -828,18 +896,31 @@ async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
       return false;
     }
 
-    const { stored, anyPartLanded } = isUs
+    const keysWereRestorable = !isUs && needingRestore.includes('groupKeys' as never);
+
+    const { stored, progressed } = isUs
       ? await restoreUserConfigs(needingRestore as Array<ConfigWrapperUser>)
       : await restoreGroupConfigs(
           pubkey as GroupPubkeyType,
           needingRestore as Array<RestorableGroupConfig>
         );
 
-    // Reset on PROGRESS, not on completion. Gated on its own value rather than reusing the
-    // one that bars hashes: those answer different questions, and letting a single boolean serve
-    // both is how this ended up backing off against a swarm that was converging.
+    // We held the bytes and the re-store did not land, so the keys are still gone from the swarm
+    // and still not back. Deferring the banner was right while we had a repair in hand; once that
+    // repair fails the user needs to know. A later successful round clears it eagerly.
+    if (keysWereRestorable && !stored) {
+      await setGroupExpired(pubkey as GroupPubkeyType, true);
+    }
+
+    // Reset on PROGRESS, not on completion — but progress means "something got BARRED", not
+    // "something returned 200". Those differ exactly when a multipart config half-lands, and that
+    // is the case that matters: all parts go back on every attempt, so a half-landing config sends
+    // the identical request next round. Treating that as progress reset the counter forever and
+    // re-sent in full on every poll.
+    // Still gated on its own value rather than reusing `stored`: with several configs, one landing
+    // in full genuinely shrinks the next round even though the swarm is not finished.
     recoveryAttemptsBySwarm.set(pubkey, {
-      consecutiveFailures: anyPartLanded ? 0 : consecutiveFailures + 1,
+      consecutiveFailures: progressed ? 0 : consecutiveFailures + 1,
       lastAttemptAt: nowMs(),
     });
 
@@ -876,6 +957,31 @@ function resetForTesting() {
  * Deliberately tolerant: any failure to answer returns false, which keeps the existing behaviour
  * rather than suppressing a flag we cannot justify suppressing.
  */
+/**
+ * Raise or clear a group's expired banner.
+ *
+ * "Expired" means its keys are gone from the swarm and **this device cannot put them back** — so it
+ * is a not-available-to-you-right-now signal, not a statement about the group. A peer that still
+ * holds the bytes clears it by re-storing them.
+ */
+async function setGroupExpired(groupPk: GroupPubkeyType, expired: boolean) {
+  try {
+    const convo = ConvoHub.use().get(groupPk);
+    if (!convo || convo.getIsExpired03Group() === expired) {
+      return;
+    }
+    window.log.info(
+      `ConfigRecovery: marking ${ed25519Str(groupPk)} ${expired ? 'EXPIRED' : 'not expired'}`
+    );
+    convo.setIsExpired03Group(expired);
+    await convo.commit();
+  } catch (e) {
+    window.log.warn(
+      `ConfigRecovery: could not set expired flag for ${ed25519Str(groupPk)}: ${e.message}`
+    );
+  }
+}
+
 async function canRepairGroupKeys(groupPk: GroupPubkeyType) {
   try {
     return !isEmpty(await MetaGroupWrapperActions.activeKeyMessages(groupPk));
@@ -896,6 +1002,11 @@ async function waitForRecoveryForTesting(pubkey: AccountPubkey) {
   await recoveryInFlight.get(pubkey);
 }
 
+/** exported for tests only — as with the bars, this leak is invisible from outside */
+function trackedDetectionCountForTesting(pubkey: AccountPubkey) {
+  return missingHashesByPubkey.get(pubkey)?.size ?? 0;
+}
+
 /** exported for tests only — the leak this guards is otherwise unobservable from outside */
 function barredHashCountForTesting() {
   return hashSettledAt.size;
@@ -903,6 +1014,7 @@ function barredHashCountForTesting() {
 
 export const ConfigRecovery = {
   barredHashCountForTesting,
+  trackedDetectionCountForTesting,
   markLocalStateLevelWithSwarm,
   setNowForTesting,
   markMergeIncompleteForSwarm,

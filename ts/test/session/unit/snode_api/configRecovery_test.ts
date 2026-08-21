@@ -368,10 +368,17 @@ describe('ConfigRecovery', () => {
     expect(storeRequestsSent().length, 'all three parts go back').to.be.eq(3);
   });
 
-  it('a half-landing multipart config resets the backoff — progress is not failure', async () => {
-    // The parts that stored are barred, so the next round is strictly smaller: the swarm is
-    // converging and is demonstrably reachable. Backing off would penalise it for making progress.
-    const fakeNow = 1_700_000_000_000; // deliberately not advanced: the reset is what lets it retry
+  it('a persistently half-landing config is RATE-LIMITED, not retried on every poll', async () => {
+    // The storm this replaces: the reset was keyed on "any sub-request returned 200", so a config
+    // with one part that always succeeds beside one that always fails reset the counter every
+    // round. Nothing barred, backoffMsFor(0) is 0, identical full re-send on every poll — measured
+    // at 10 rounds / 10 sends / 0 barred.
+    //
+    // ⚠️ This test pins the SIZE of the retry, not its existence. The version it replaces asserted
+    // only that a second attempt happened, which is true of the storm too — that is precisely why
+    // the defect survived: all parts go back on every attempt (§3.4), so a half-landing config
+    // never shrinks its next round and "it retried" cannot distinguish progress from a loop.
+    const fakeNow = 1_700_000_000_000; // deliberately not advanced
     ConfigRecovery.setNowForTesting(() => fakeNow);
     stubWrappers({ activeHashes: ['P1', 'P2'], parts: [new Uint8Array([1]), new Uint8Array([2])] });
     ConfigRecovery.markLocalStateLevelWithSwarm(us);
@@ -381,19 +388,98 @@ describe('ConfigRecovery', () => {
       sortedSubRequests.map((_r: unknown, i: number) => ({ code: i === 0 ? 200 : 500, body: {} }))
     );
 
-    detectMissing(['P1']);
-    await ConfigRecovery.recoverIfNeeded(us);
-    expect(sendStub.callCount).to.be.eq(1);
-
-    // with the backoff reset by the partial landing, the very next poll may try again. A reset
-    // gated on FULL success would make this wait 60s and fail.
-    detectMissing(['P1']);
-    await ConfigRecovery.recoverIfNeeded(us);
+    for (let poll = 0; poll < 10; poll++) {
+      detectMissing(['P1']);
+      // eslint-disable-next-line no-await-in-loop
+      await ConfigRecovery.recoverIfNeeded(us);
+    }
 
     expect(
       sendStub.callCount,
-      'a config that half-landed is converging, so it is not made to wait'
-    ).to.be.eq(2);
+      'ten polls collapse to one attempt — nothing was barred, so this is not progress'
+    ).to.be.eq(1);
+    expect(ConfigRecovery.barredHashCountForTesting(), 'and nothing is barred').to.be.eq(0);
+  });
+
+  it('but one config landing IN FULL beside a failing one DOES reset the backoff', async () => {
+    // The counterpart, and the reason the reset is not simply keyed on total success: when several
+    // configs are in flight and one lands completely, its hashes ARE barred and the next round is
+    // genuinely smaller. That is convergence and must not be penalised.
+    //
+    // Without this pair, "reset on full success only" would look equally correct and would back off
+    // against a swarm that is demonstrably making ground.
+    const fakeNow = 1_700_000_000_000;
+    ConfigRecovery.setNowForTesting(() => fakeNow);
+    Sinon.stub(UserGenericWrapperActions, 'needsPush').resolves(false);
+    Sinon.stub(UserGenericWrapperActions, 'activeHashes').callsFake(async variant =>
+      variant === 'ContactsConfig' ? ['C1'] : variant === 'UserConfig' ? ['U1'] : []
+    );
+    Sinon.stub(UserGenericWrapperActions, 'push').resolves({
+      data: [new Uint8Array([1])],
+      seqno: 5,
+      hashes: [],
+      namespace: SnodeNamespaces.UserContacts,
+    });
+    ConfigRecovery.markLocalStateLevelWithSwarm(us);
+
+    // the first config's store lands, the second's does not
+    sendStub.callsFake(async ({ sortedSubRequests }: any) =>
+      sortedSubRequests.map((_r: unknown, i: number) => ({ code: i === 0 ? 200 : 500, body: {} }))
+    );
+
+    detectMissing(['C1', 'U1']);
+    await ConfigRecovery.recoverIfNeeded(us);
+    expect(sendStub.callCount).to.be.eq(1);
+    expect(
+      ConfigRecovery.barredHashCountForTesting(),
+      'the config that landed in full is barred — this is what makes the next round smaller'
+    ).to.be.greaterThan(0);
+
+    // and because something was barred, the very next poll is allowed to try again
+    detectMissing(['U1']);
+    await ConfigRecovery.recoverIfNeeded(us);
+    expect(sendStub.callCount, 'a converging swarm is not made to wait').to.be.eq(2);
+  });
+
+  it('settled detections are PRUNED — the accumulator does not grow for the life of the process', async () => {
+    // Same leak pruneExpiredBars was written for, one map over and against the same population.
+    // Hashes rotate on every re-push and a Desktop session runs for days, so every superseded hash
+    // would otherwise be retained forever.
+    //
+    // ⚠️ The hashes must ROTATE between rounds, exactly as in the bars test. Re-detecting the same
+    // hashes writes the same Set entries, so the size is unchanged whether or not it prunes — a
+    // version of this reusing one hash set passes with the pruning removed.
+    let fakeNow = 1_700_000_000_000;
+    ConfigRecovery.setNowForTesting(() => fakeNow);
+    let currentHashes = ['R1', 'R2'];
+    Sinon.stub(UserGenericWrapperActions, 'needsPush').resolves(false);
+    Sinon.stub(UserGenericWrapperActions, 'activeHashes').callsFake(async variant =>
+      variant === 'ContactsConfig' ? currentHashes : []
+    );
+    Sinon.stub(UserGenericWrapperActions, 'push').resolves({
+      data: [new Uint8Array([1])],
+      seqno: 5,
+      hashes: [],
+      namespace: SnodeNamespaces.UserContacts,
+    });
+    ConfigRecovery.markLocalStateLevelWithSwarm(us);
+
+    for (let round = 0; round < 5; round++) {
+      currentHashes = [`R${round}a`, `R${round}b`];
+      detectMissing([`R${round}a`]);
+      // eslint-disable-next-line no-await-in-loop
+      await ConfigRecovery.recoverIfNeeded(us);
+      fakeNow += 61 * 60 * 1000; // past the bar, so the next round is admitted
+    }
+
+    // ONE, not five, and not zero. The property is that it stays CONSTANT as rounds accumulate —
+    // the single entry is the round just completed, whose hashes were settled by a restore that ran
+    // after this round's prune and will be dropped by the next one. Without pruning this is 5 and
+    // climbs with every poll for the life of the process.
+    expect(
+      ConfigRecovery.trackedDetectionCountForTesting(us),
+      'the accumulator is bounded by the round in flight, not by how many rounds have run'
+    ).to.be.eq(1);
   });
 
   it('V13e: a hash ruled out by a GUARD is settled, not re-examined every poll', async () => {

@@ -398,6 +398,103 @@ describe('ConfigRecovery (groups)', () => {
     expect(await ConfigRecovery.canRepairGroupKeys(groupPk)).to.be.false;
   });
 
+  it('Q4/V16: all keys hashes gone and NO retained bytes -> the group is flagged EXPIRED', async () => {
+    // Nothing used to set this flag from detection at all. The poller's empty-fetch branch cannot
+    // reach this case by construction: it requires holding NO config hashes, and a device in this
+    // state holds plenty — the hashes are exactly what told us they were missing.
+    const setExpired = Sinon.stub();
+    Sinon.stub(ConvoHub, 'use').returns({
+      get: () => ({
+        getIsExpired03Group: () => false,
+        setIsExpired03Group: setExpired,
+        commit: Sinon.stub().resolves(),
+      }),
+    } as any);
+
+    stubGroup({ retainedKeyMessages: {} });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(setExpired.calledOnceWith(true), 'the banner is raised').to.be.true;
+  });
+
+  it('Q4/V16a: only SOME keys hashes gone -> NOT expired, even with no bytes', async () => {
+    // The reachability control for the assertion above, and the vector's own point: one surviving
+    // keys hash still lets a new device in, so a partial miss is not an expired group.
+    const setExpired = Sinon.stub();
+    Sinon.stub(ConvoHub, 'use').returns({
+      get: () => ({
+        getIsExpired03Group: () => false,
+        setIsExpired03Group: setExpired,
+        commit: Sinon.stub().resolves(),
+      }),
+    } as any);
+
+    stubGroup({ keysHashes: [KEYS_HASH, 'keyshash2'], retainedKeyMessages: {} });
+    detectMissing([KEYS_HASH]); // one of two
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(setExpired.called, 'one surviving keys hash is not an expired group').to.be.false;
+  });
+
+  it('Q4/V23c: bytes held but the keys re-store FAILS -> expired after all', async () => {
+    // The banner is deferred while we hold a repair in hand. Once that repair fails the keys are
+    // still gone and still not back, so the user needs to know.
+    const setExpired = Sinon.stub();
+    Sinon.stub(ConvoHub, 'use').returns({
+      get: () => ({
+        getIsExpired03Group: () => false,
+        setIsExpired03Group: setExpired,
+        commit: Sinon.stub().resolves(),
+      }),
+    } as any);
+
+    stubGroup({ retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+    sendStub.callsFake(async ({ sortedSubRequests }: any) =>
+      sortedSubRequests.map(() => ({ code: 500, body: {} }))
+    );
+
+    await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(keysStoresSent().length, 'the repair was attempted').to.be.eq(1);
+    expect(setExpired.calledWith(true), 'and having failed, the banner goes up').to.be.true;
+  });
+
+  it('Q10: a dirty groupInfo does NOT block KEYS recovery', async () => {
+    // Ruling v139. The clean-only gate exists so local state cannot overwrite newer remote state.
+    // Keys recovery replays the exact bytes the swarm already had, so it cannot overwrite anything,
+    // and a pending rekey produces a NEW message at a NEW generation — which says nothing about
+    // whether the retained ones are stale. Gating keys on a dirty groupInfo excluded groups in
+    // active use, which is the population most likely to need them.
+    stubGroup({ needsPush: true, retainedKeyMessages: { [KEYS_HASH]: new Uint8Array([9]) } });
+    detectMissing([KEYS_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(ran, 'keys go back even though the group is dirty').to.be.true;
+    expect(keysStoresSent().length).to.be.eq(1);
+  });
+
+  it('Q10 counterpart: a dirty group still blocks groupInfo/groupMember', async () => {
+    // The exemption is keys-only. Info and members are re-serialised from local state, so the gate
+    // is doing real work for them — without this, "dirty blocks nothing" would pass the test above.
+    stubGroup({ needsPush: true });
+    detectMissing([INFO_HASH]);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+
+    const ran = await ConfigRecovery.recoverIfNeeded(groupPk);
+
+    expect(ran).to.be.false;
+    expect(infoStoresSent().length, 'GroupSync will push it under a new hash anyway').to.be.eq(0);
+  });
+
   it('a KICKED group is not re-stored', async () => {
     stubGroup({ kicked: true });
     detectMissing([INFO_HASH]);

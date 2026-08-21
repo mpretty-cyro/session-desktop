@@ -107,11 +107,25 @@ function mergeMultipleRetrieveResults(
   }
 
   // Convert the merged map back to an array
-  return Array.from(mapped.entries()).map(([namespace, messagesMap]) => ({
-    code: results.find(m => m.namespace === namespace)?.code || 200,
-    namespace,
-    messages: { messages: Array.from(messagesMap.values()) },
-  }));
+  return Array.from(mapped.entries()).map(([namespace, messagesMap]) => {
+    // A namespace ANSWERED if any snode we polled returned 200 for it: the messages above are the
+    // union across snodes, so one snode failing does not cost us that namespace's content.
+    //
+    // This used to be `results.find(...)?.code || 200`, which was wrong twice. `find` takes the
+    // first entry for the namespace across all snodes, so the verdict depended on result ordering
+    // and was arbitrary in BOTH directions — not conservative. And `|| 200` turned a missing or
+    // zero code into a pass, defaulting the one direction that must never default.
+    //
+    // The only consumer is allConfigNamespacesAnswered, which decides whether we are level with the
+    // swarm — so an unanswered namespace reading as answered is the failure that matters.
+    const codes = results.filter(m => m.namespace === namespace).map(m => m.code);
+
+    return {
+      code: codes.includes(200) ? 200 : (codes[0] ?? 0),
+      namespace,
+      messages: { messages: Array.from(messagesMap.values()) },
+    };
+  });
 }
 
 /**
