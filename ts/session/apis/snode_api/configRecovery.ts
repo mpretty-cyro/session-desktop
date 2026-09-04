@@ -24,13 +24,12 @@ import {
   StoreUserConfigSubRequest,
 } from './SnodeRequestTypes';
 import { ConfigExpiryDetection } from './configExpiryDetection';
-import { ed25519Str } from '../../utils/String';
+import { ed25519Str, fromBase64ToArray } from '../../utils/String';
 import { PubKey } from '../../types';
 import { ConvoHub } from '../../conversations';
 import { SnodePool } from './snodePool';
 import { SnodeAPIRetrieve } from './retrieveRequest';
 import { SnodeNamespaces } from './namespaces';
-import { fromBase64ToArray } from '../../utils/String';
 
 type SnodeSubRequestForRecovery = StoreUserConfigSubRequest | DeleteHashesFromUserNodeSubRequest;
 

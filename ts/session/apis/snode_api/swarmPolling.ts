@@ -36,6 +36,7 @@ import { SnodeNamespace, SnodeNamespaces, SnodeNamespacesUserConfig } from './na
 import { PollForGroup, PollForLegacy, PollForUs } from './pollingTypes';
 import { SnodeAPIRetrieve } from './retrieveRequest';
 import { ConfigRecovery } from './configRecovery';
+import { ConfigRecoveryForceRekey } from './configRecoveryForceRekey';
 import { SnodePool } from './snodePool';
 import { SwarmPollingGroupConfig } from './swarm_polling_config/SwarmPollingGroupConfig';
 import { SwarmPollingUserConfig } from './swarm_polling_config/SwarmPollingUserConfig';
@@ -581,11 +582,16 @@ export class SwarmPolling {
       ConfigRecovery.markMergeIncompleteForSwarm(pubkey);
     }
 
-    if (
+    // Named rather than inlined into the `if`, because the force rekey below is HANDED this value.
+    // Passing a literal `true` from inside the branch would be correct only for as long as the call
+    // stays inside it — the value would silently become a lie the moment anyone moved it. This way
+    // the thing asserted and the thing computed are the same expression.
+    const levelWithSwarmThisPoll =
       atLeastOneSnodeAnswered &&
       allConfigNamespacesAnswered(resultsFromAllNamespaces, type) &&
-      mergedEverythingFetched
-    ) {
+      mergedEverythingFetched;
+
+    if (levelWithSwarmThisPoll) {
       ConfigRecovery.markLocalStateLevelWithSwarm(pubkey);
       // not awaited — see the note on the other call site above
       void ConfigRecovery.recoverIfNeeded(pubkey);
@@ -596,6 +602,12 @@ export class SwarmPolling {
       // detection fires, the message it needed to fetch is gone.
       if (PubKey.is03Pubkey(pubkey)) {
         void ConfigRecovery.backfillGroupKeysIfNeeded(pubkey);
+
+        // The freshness fact is computed HERE and passed in, because it is a property of this poll
+        // and nothing downstream can reconstruct it: the level marker is set once per process and
+        // never says whether it is still true. A rekey encrypts to our current view of the members,
+        // so a stale view silently drops anyone added since.
+        void ConfigRecoveryForceRekey.forceRekeyIfPossible(pubkey, { levelWithSwarmThisPoll });
       }
     }
 
