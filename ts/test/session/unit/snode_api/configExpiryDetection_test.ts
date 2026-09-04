@@ -7,9 +7,12 @@ import { ExpireMessagesResultsContent } from '../../../../session/apis/snode_api
 const { expect } = chai;
 
 /**
- * The shared detection vectors, one test each. iOS and Android implement
- * the same rule separately, and these vectors are the only thing keeping the three in agreement —
- * so don't relax one to make an implementation pass, change the spec.
+ * The shared detection vectors, one test each. iOS and Android implement the same rule separately,
+ * and these vectors are the only thing keeping the three in agreement.
+ *
+ * So a vector failing here is a disagreement between clients, not a test that needs adjusting. If
+ * one of these looks wrong, the other two implementations are the thing to check first — relaxing
+ * it to make this client pass removes the only evidence that they have diverged.
  */
 
 const H1 = 'hash1';

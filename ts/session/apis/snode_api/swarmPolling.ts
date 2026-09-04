@@ -132,12 +132,16 @@ function mergeMultipleRetrieveResults(
 /**
  * Whether every config namespace we polled actually answered.
  *
- * Being "level with the swarm" is about knowing the swarm state for the configs we are about to
- * act on. A poll
- * fetches several namespaces at once and they can fail independently, so one namespace erroring
- * while the others answer leaves us ignorant about exactly its configs — a partial answer, not a
- * full one. We gate the whole swarm rather than the individual namespace: the spec allows either,
- * and the coarser one cannot be got subtly wrong.
+ * Being "level with the swarm" is about knowing the swarm state for the configs we are about to act
+ * on. A poll fetches several namespaces at once and they can fail independently, so one namespace
+ * erroring while the others answer leaves us ignorant about exactly its configs — a partial answer,
+ * not a full one.
+ *
+ * We gate the WHOLE SWARM rather than the individual namespace, and the reason is local: gating per
+ * namespace means mapping each hash we are about to act on back to the namespace it came from, and
+ * keeping that mapping correct as either side changes. Get it wrong and we act on a config we are
+ * ignorant about, silently. Gating the whole swarm is coarser — we skip a repair we could safely
+ * have made — but its failure mode is doing nothing, which the next poll fixes.
  */
 function allConfigNamespacesAnswered(
   results: RetrieveMessagesResultsMergedBatched,

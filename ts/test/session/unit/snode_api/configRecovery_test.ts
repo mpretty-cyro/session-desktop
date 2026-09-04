@@ -508,9 +508,9 @@ describe('ConfigRecovery', () => {
 
   it('V13a + V13b: a store whose SUB-RESPONSE failed is retried, though the batch returned 200', async () => {
     // Two vectors, one fixture, because they are two claims about the same situation:
-    //   V13a — the bar keys on SUCCESS, not on attempt. Read as a pair with V13,
-    //          which alone passes on a bars-on-attempt implementation; that is why that reading
-    //          survived 39 spec revisions.
+    //   V13a — the bar keys on SUCCESS, not on attempt. Read as a pair with V13, which alone
+    //          passes on a bars-on-attempt implementation — which is why that reading went
+    //          unnoticed for a long time. V13 cannot catch it; only this pairing can.
     //   V13b — "success" means every SUB-RESPONSE's own code, not that the outer batch returned.
     //          A sequence returns 200 while its sub-requests carry their own codes, so barring on
     //          "did not throw" would settle a hash having written nothing.

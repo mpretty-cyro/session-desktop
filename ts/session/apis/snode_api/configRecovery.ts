@@ -901,7 +901,7 @@ async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
     // not look like a problem: what it actually does is re-examine and re-log the same detection on
     // every poll, forever.
     // Settled here means barred for HASH_BAR_MS, NOT for the session — a guard's verdict CAN change
-    // over hours (v66), so the bar buys quiet without withdrawing the hash permanently.
+    // over hours, so the bar buys quiet without withdrawing the hash permanently.
     // An inspection that THREW is not a guard verdict, so nothing is settled on that pass.
     if (inspectedEverything) {
       missingHashes
