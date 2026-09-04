@@ -27,6 +27,10 @@ import { ConfigExpiryDetection } from './configExpiryDetection';
 import { ed25519Str } from '../../utils/String';
 import { PubKey } from '../../types';
 import { ConvoHub } from '../../conversations';
+import { SnodePool } from './snodePool';
+import { SnodeAPIRetrieve } from './retrieveRequest';
+import { SnodeNamespaces } from './namespaces';
+import { fromBase64ToArray } from '../../utils/String';
 
 type SnodeSubRequestForRecovery = StoreUserConfigSubRequest | DeleteHashesFromUserNodeSubRequest;
 
@@ -122,6 +126,15 @@ const missingHashesByPubkey = new Map<AccountPubkey, Set<string>>();
  * but it is what lets a test assert on the outcome of an unawaited round without sleeping.
  */
 const recoveryInFlight = new Map<AccountPubkey, Promise<boolean>>();
+/**
+ * Groups where a keys backfill has run and the bytes are STILL absent.
+ *
+ * In memory on purpose. A persisted record would be a sticky negative — it would let the rekey fire
+ * on evidence gathered weeks ago, after the swarm has changed underneath it. Forgetting on restart
+ * delays the rekey by one poll cycle, which is the safe direction for the one irreversible,
+ * externally visible write in this feature.
+ */
+const keysBackfillFailedAt = new Map<GroupPubkeyType, number>();
 const recoveryAttemptsBySwarm = new Map<
   AccountPubkey,
   { consecutiveFailures: number; lastAttemptAt: number }
@@ -546,7 +559,7 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
       return { needingRestore, coveredHashes, inspectedEverything: true, keysUnrecoverableHere };
     }
 
-    // Clean configs only — but ⚠️ this gate does NOT apply to GroupKeys (ruling v139).
+    // Clean configs only — but ⚠️ this gate does NOT apply to GroupKeys.
     //
     // The gate exists so local state cannot overwrite newer remote state. Keys recovery replays the
     // exact bytes the swarm already had — byte-identical, same hash — so it cannot overwrite
@@ -962,6 +975,7 @@ function resetForTesting() {
   hashSettledAt.clear();
   missingHashesByPubkey.clear();
   recoveryInFlight.clear();
+  keysBackfillFailedAt.clear();
 }
 
 /**
@@ -973,6 +987,132 @@ function resetForTesting() {
  * Deliberately tolerant: any failure to answer returns false, which keeps the existing behaviour
  * rather than suppressing a flag we cannot justify suppressing.
  */
+/**
+ * Which of a group's active keys hashes we hold NO BYTES for.
+ *
+ * `activeHashesByConfig().groupKeys` names every keys message still active; `activeKeyMessages()`
+ * returns only the ones whose bytes libSession retained. A hash in the first and not the second is
+ * a message that is still on the swarm and that we could not put back if it ever expired.
+ */
+async function keysHashesWeLackBytesFor(groupPk: GroupPubkeyType) {
+  const byConfig = await MetaGroupWrapperActions.activeHashesByConfig(groupPk);
+  const retained = await MetaGroupWrapperActions.activeKeyMessages(groupPk);
+
+  return byConfig.groupKeys.filter(hash => !(hash in retained));
+}
+
+/**
+ * Re-fetch and re-merge a group's keys messages so libSession retains their bytes.
+ *
+ * ⚠️ PROACTIVE, NOT ON DETECTION, and that distinction is the whole value. Detection fires when the
+ * swarm has already LOST a hash — by then there is nothing left to fetch and this can do nothing.
+ * This fires while the message is still there, which is the only window in which it works.
+ *
+ * Re-loading a keys message we already hold the key for is a no-op for KEY STATE (insert_key
+ * early-returns) but NOT for RETENTION: that early-return path still stores the bytes and flags a
+ * dump. So this is cheap and safe against a group whose keys are perfectly healthy.
+ *
+ * @returns whether we now hold bytes for every active keys hash.
+ */
+async function backfillGroupKeys(groupPk: GroupPubkeyType): Promise<boolean> {
+  if (isEmpty(await keysHashesWeLackBytesFor(groupPk))) {
+    return true;
+  }
+
+  const swarm = await SnodePool.getSwarmFor(groupPk);
+  const targetNode = swarm[0];
+  if (!targetNode) {
+    // Not an attempt — we never asked anyone. Throwing keeps the caller from recording a failure
+    // for a group we learned nothing about.
+    throw new Error('backfillGroupKeys: no snode in swarm');
+  }
+
+  // ⚠️ The retrieve layer DIRECTLY, never the poll wrapper. `pollNodeForKey` writes the namespace
+  // cursor from whatever it fetched (swarmPolling.ts:902), and this asks with NO last_hash, so
+  // routing through it would advance the cursor past messages the poll never consumed. Nothing
+  // below the retrieve writes the cursor — the only writers are that call site and the Data helper
+  // it calls — so staying outside it is sufficient here, which is not true on every platform.
+  const results = await SnodeAPIRetrieve.retrieveNextMessagesNoRetries(
+    targetNode,
+    groupPk,
+    [{ lastHash: '', namespace: SnodeNamespaces.ClosedGroupKeys }],
+    UserUtils.getOurPubKeyStrFromCache(),
+    null,
+    true
+  );
+
+  const keysMessages = (results ?? [])
+    .filter(r => r.namespace === SnodeNamespaces.ClosedGroupKeys)
+    .flatMap(r => r.messages?.messages ?? [])
+    .filter(m => !!m?.data && !!m?.hash && !!m?.storedAt)
+    .map(m => ({
+      data: fromBase64ToArray(m.data),
+      hash: m.hash,
+      // `storedAt` is when the snode stored it, which is what the merge wants — NOT the envelope
+      // timestamp. The normal poll path uses the same field for keys messages.
+      timestampMs: m.storedAt,
+    }));
+
+  if (isEmpty(keysMessages)) {
+    return false;
+  }
+
+  await MetaGroupWrapperActions.metaMerge(groupPk, {
+    groupInfo: [],
+    groupKeys: keysMessages,
+    groupMember: [],
+  });
+
+  // ⚠️ The merge alone is not enough, and the difference is invisible in-process. Retention lives in
+  // the config DUMP, so bytes captured by a merge that never persists die with the process: the
+  // backfill appears to work and silently does not, and any test asserting within one run passes
+  // either way.
+  await LibSessionUtil.saveDumpsToDb(groupPk);
+
+  return isEmpty(await keysHashesWeLackBytesFor(groupPk));
+}
+
+/**
+ * The entry point the poller calls. Records the outcome so the rekey can tell "a backfill has run
+ * and nothing can restore these" from "a backfill has never run" — two states no other predicate
+ * distinguishes.
+ */
+async function backfillGroupKeysIfNeeded(groupPk: GroupPubkeyType) {
+  try {
+    const lastFailure = keysBackfillFailedAt.get(groupPk);
+    if (lastFailure !== undefined && nowMs() - lastFailure < HASH_BAR_MS) {
+      return;
+    }
+
+    if (await backfillGroupKeys(groupPk)) {
+      // ⚠️ CLEARED on success rather than left alone. This record is read as "this device cannot
+      // repair this group", and a device that just retained the bytes plainly can.
+      keysBackfillFailedAt.delete(groupPk);
+      return;
+    }
+
+    // ⚠️ Means ATTEMPTED AND THE BYTES ARE STILL ABSENT — not "the fetch came back empty". A fetch
+    // returning messages that still do not restore the bytes is equally a failed attempt, and
+    // recording only the empty case leaves the group looking un-attempted forever while re-fetching
+    // the same useless messages every eligible poll.
+    // The two are indistinguishable in any fixture where the swarm holds nothing, which is the
+    // first fixture anyone writes — so the test that separates them needs a swarm that returns
+    // something.
+    keysBackfillFailedAt.set(groupPk, nowMs());
+  } catch (e) {
+    // A throw is not an attempt: we never learned whether the bytes are obtainable, so recording a
+    // failure would let the rekey act on evidence we do not have.
+    window.log.warn(
+      `ConfigRecovery: keys backfill for ${ed25519Str(groupPk)} failed: ${e.message}`
+    );
+  }
+}
+
+/** Has a backfill run for this group and still come up short? Read by the rekey's precondition. */
+function keysBackfillHasFailedFor(groupPk: GroupPubkeyType) {
+  return keysBackfillFailedAt.has(groupPk);
+}
+
 /**
  * Raise or clear a group's expired banner.
  *
@@ -1039,6 +1179,8 @@ export const ConfigRecovery = {
   getMissingHashes,
   recoverIfNeeded,
   canRepairGroupKeys,
+  backfillGroupKeysIfNeeded,
+  keysBackfillHasFailedFor,
   resetForTesting,
   waitForRecoveryForTesting,
 };

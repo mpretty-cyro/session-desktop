@@ -19,6 +19,9 @@ import {
 } from '../../../../session/apis/snode_api/SnodeRequestTypes';
 import { TestUtils } from '../../../test-utils';
 import { ConvoHub } from '../../../../session/conversations';
+import { SnodePool } from '../../../../session/apis/snode_api/snodePool';
+import { SnodeAPIRetrieve } from '../../../../session/apis/snode_api/retrieveRequest';
+import { SnodeNamespaces } from '../../../../session/apis/snode_api/namespaces';
 
 const { expect } = chai;
 
@@ -467,7 +470,7 @@ describe('ConfigRecovery (groups)', () => {
   });
 
   it('Q10: a dirty groupInfo does NOT block KEYS recovery', async () => {
-    // Ruling v139. The clean-only gate exists so local state cannot overwrite newer remote state.
+    // The clean-only gate exists so local state cannot overwrite newer remote state.
     // Keys recovery replays the exact bytes the swarm already had, so it cannot overwrite anything,
     // and a pending rekey produces a NEW message at a NEW generation — which says nothing about
     // whether the retained ones are stale. Gating keys on a dirty groupInfo excluded groups in
@@ -493,6 +496,165 @@ describe('ConfigRecovery (groups)', () => {
 
     expect(ran).to.be.false;
     expect(infoStoresSent().length, 'GroupSync will push it under a new hash anyway').to.be.eq(0);
+  });
+
+  describe('keys backfill', () => {
+    // The backfill exists to capture BYTES for keys messages the swarm still holds, so that this
+    // device can repair the group later. It runs proactively — by the time detection fires, the
+    // message it would have fetched is gone.
+
+    function stubBackfill({
+      keysHashes = [KEYS_HASH],
+      retained = {} as Record<string, Uint8Array>,
+      retainedAfterMerge = null as Record<string, Uint8Array> | null,
+      fetched = [] as Array<{ hash: string; data: string; storedAt: number }>,
+    } = {}) {
+      Sinon.stub(SnodePool, 'getSwarmFor').resolves([
+        { pubkey_ed25519: 'ed', ip: '1', port: 1 },
+      ] as any);
+      const hashesStub = Sinon.stub(MetaGroupWrapperActions, 'activeHashesByConfig').resolves({
+        groupInfo: [],
+        groupMember: [],
+        groupKeys: keysHashes,
+      });
+      // second call (after the merge) reports the post-merge state when one is given
+      const keysStub = Sinon.stub(MetaGroupWrapperActions, 'activeKeyMessages');
+      keysStub.onFirstCall().resolves(retained);
+      keysStub.resolves(retainedAfterMerge ?? retained);
+      const mergeStub = Sinon.stub(MetaGroupWrapperActions, 'metaMerge').resolves(undefined as any);
+      const retrieveStub = Sinon.stub(SnodeAPIRetrieve, 'retrieveNextMessagesNoRetries').resolves([
+        { code: 200, namespace: SnodeNamespaces.ClosedGroupKeys, messages: { messages: fetched } },
+      ] as any);
+      return { hashesStub, keysStub, mergeStub, retrieveStub };
+    }
+
+    it('does nothing when we already hold bytes for every active keys hash', async () => {
+      const { retrieveStub } = stubBackfill({ retained: { [KEYS_HASH]: new Uint8Array([1]) } });
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(retrieveStub.called, 'no fetch when there is nothing to capture').to.be.false;
+      expect(ConfigRecovery.keysBackfillHasFailedFor(groupPk)).to.be.false;
+    });
+
+    it('fetches the keys namespace with NO last_hash and merges what comes back', async () => {
+      const { retrieveStub, mergeStub } = stubBackfill({
+        fetched: [{ hash: KEYS_HASH, data: 'AQID', storedAt: 111 }],
+        retainedAfterMerge: { [KEYS_HASH]: new Uint8Array([1]) },
+      });
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(retrieveStub.calledOnce, 'it fetched').to.be.true;
+      const namespaces = retrieveStub.firstCall.args[2];
+      expect(namespaces, 'the keys namespace, and only that').to.be.deep.eq([
+        { lastHash: '', namespace: SnodeNamespaces.ClosedGroupKeys },
+      ]);
+      expect(mergeStub.calledOnce, 'and merged').to.be.true;
+      expect(
+        mergeStub.firstCall.args[1].groupKeys!.length,
+        'the fetched keys message went into the merge'
+      ).to.be.eq(1);
+    });
+
+    it('PERSISTS the dump — a merge that only captures in memory dies with the process', async () => {
+      // iOS hit this: retention lives in the config dump, so bytes captured by a merge that never
+      // persists are gone on restart. It passes every in-process assertion either way.
+      //
+      // ⚠️ On Desktop the hazard is worse: saveDumpsToDb is stubbed in this file's beforeEach for an
+      // unrelated reason, so an implementation that never persists passes the whole suite silently.
+      // Hence the PREMISE assertion first — without it "saveDumpsToDb was called" is also satisfied
+      // by a path that exited before the merge.
+      const { mergeStub } = stubBackfill({
+        fetched: [{ hash: KEYS_HASH, data: 'AQID', storedAt: 111 }],
+        retainedAfterMerge: { [KEYS_HASH]: new Uint8Array([1]) },
+      });
+      const saveStub = LibSessionUtil.saveDumpsToDb as unknown as Sinon.SinonStub;
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(mergeStub.called, 'PREMISE: the merge ran at all').to.be.true;
+      expect(saveStub.calledWith(groupPk), 'and the dump was persisted for this group').to.be.true;
+    });
+
+    it('records a failure when the fetch comes back EMPTY', async () => {
+      stubBackfill({ fetched: [] });
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(ConfigRecovery.keysBackfillHasFailedFor(groupPk)).to.be.true;
+    });
+
+    it('records a failure when messages ARRIVE but the bytes are still absent', async () => {
+      // 🔴 The one that separates "attempted and still absent" from "the fetch was empty". Both look
+      // identical in any fixture where the swarm has nothing — which is the fixture above, and the
+      // first one anyone writes. An implementation that only records the empty case passes that one
+      // and fails this, and without this test it would refetch the same useless messages forever.
+      const { mergeStub } = stubBackfill({
+        fetched: [{ hash: 'someotherhash', data: 'AQID', storedAt: 111 }],
+        retained: {},
+        retainedAfterMerge: {}, // merged something, still hold no bytes for KEYS_HASH
+      });
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(mergeStub.called, 'PREMISE: it got as far as merging').to.be.true;
+      expect(
+        ConfigRecovery.keysBackfillHasFailedFor(groupPk),
+        'a merge that did not restore the bytes is still a failed attempt'
+      ).to.be.true;
+    });
+
+    it('CLEARS the failure once the bytes are obtained', async () => {
+      // The record is read as "this device cannot repair this group". A device that just retained
+      // the bytes plainly can, so leaving it set would permanently misreport it to the rekey.
+      stubBackfill({ fetched: [] });
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+      expect(ConfigRecovery.keysBackfillHasFailedFor(groupPk), 'failed first').to.be.true;
+
+      Sinon.restore();
+      TestUtils.stubWindowLog();
+      Sinon.stub(LibSessionUtil, 'saveDumpsToDb').resolves();
+      ConfigRecovery.setNowForTesting(() => Date.now() + 2 * 60 * 60 * 1000);
+      stubBackfill({ retained: { [KEYS_HASH]: new Uint8Array([1]) } });
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(ConfigRecovery.keysBackfillHasFailedFor(groupPk), 'cleared once we hold them').to.be
+        .false;
+    });
+
+    it('a THROW is not an attempt — no failure recorded', async () => {
+      // We never learned whether the bytes are obtainable. Recording a failure would let the rekey
+      // act on evidence we do not have.
+      Sinon.stub(SnodePool, 'getSwarmFor').resolves([] as any);
+      Sinon.stub(MetaGroupWrapperActions, 'activeHashesByConfig').resolves({
+        groupInfo: [],
+        groupMember: [],
+        groupKeys: [KEYS_HASH],
+      });
+      Sinon.stub(MetaGroupWrapperActions, 'activeKeyMessages').resolves({});
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(
+        ConfigRecovery.keysBackfillHasFailedFor(groupPk),
+        'an empty swarm tells us nothing about the bytes'
+      ).to.be.false;
+    });
+
+    it('does not re-attempt within the bar', async () => {
+      stubBackfill({ fetched: [] });
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+      const { retrieveStub } = {
+        retrieveStub: SnodeAPIRetrieve.retrieveNextMessagesNoRetries as unknown as Sinon.SinonStub,
+      };
+      expect(retrieveStub.callCount, 'first attempt fetched').to.be.eq(1);
+
+      await ConfigRecovery.backfillGroupKeysIfNeeded(groupPk);
+
+      expect(retrieveStub.callCount, 'the second is barred, not retried').to.be.eq(1);
+    });
   });
 
   it('a KICKED group is not re-stored', async () => {

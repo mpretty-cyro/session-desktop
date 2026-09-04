@@ -589,6 +589,14 @@ export class SwarmPolling {
       ConfigRecovery.markLocalStateLevelWithSwarm(pubkey);
       // not awaited — see the note on the other call site above
       void ConfigRecovery.recoverIfNeeded(pubkey);
+
+      // The keys backfill runs PROACTIVELY, beside recovery rather than inside it. Recovery acts on
+      // a hash the swarm has LOST; the backfill acts on a hash the swarm still HAS but whose bytes
+      // we never retained. Hanging it off the detection path would be nearly useless — by the time
+      // detection fires, the message it needed to fetch is gone.
+      if (PubKey.is03Pubkey(pubkey)) {
+        void ConfigRecovery.backfillGroupKeysIfNeeded(pubkey);
+      }
     }
 
     await this.handleRevokedMessages({ revokedMessages, groupPk: pubkey, type });
