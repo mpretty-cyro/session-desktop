@@ -376,7 +376,7 @@ describe('ConfigRecovery', () => {
     //
     // ⚠️ This test pins the SIZE of the retry, not its existence. The version it replaces asserted
     // only that a second attempt happened, which is true of the storm too — that is precisely why
-    // the defect survived: all parts go back on every attempt (§3.4), so a half-landing config
+    // the defect survived: every part goes back on every attempt, so a half-landing config
     // never shrinks its next round and "it retried" cannot distinguish progress from a loop.
     const fakeNow = 1_700_000_000_000; // deliberately not advanced
     ConfigRecovery.setNowForTesting(() => fakeNow);
@@ -483,7 +483,7 @@ describe('ConfigRecovery', () => {
   });
 
   it('V13e: a hash ruled out by a GUARD is settled, not re-examined every poll', async () => {
-    // "not stored" is three outcomes, not two (spec v44). Stored -> barred; store FAILED ->
+    // "not stored" is three outcomes, not two. Stored -> barred; store FAILED ->
     // retryable; ruled out by a guard -> barred, because no guard's verdict changes within a
     // session. Folding guard-rejections into "failure" costs no requests — the rejection happens
     // before any network call — which is exactly why it does not look like a problem: it silently
