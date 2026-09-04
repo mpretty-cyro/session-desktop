@@ -80,6 +80,22 @@ type AccountPubkey = PubkeyType | GroupPubkeyType;
  *
  * The scoping is NOT uniform across these declarations, though it reads as if it should be and it
  * once was — the two Sets below are session-scoped, `hashSettledAt` is time-bounded.
+ *
+ * ⚠️ SESSION-SCOPED HERE MEANS PROCESS-LIFETIME, WHICH ON DESKTOP IS WEEKS. Nothing ages these Sets
+ * out: `swarmsLevelWithLocalState` is added to on the first good poll of the process and removed
+ * only by the sticky merge-incomplete withdrawal. So `localStateIsLevelWithSwarm` answers "was
+ * level at SOME POINT since startup", never "is level now", and the staleness it permits is
+ * unbounded.
+ *
+ * That is correct for what reads it today: recovery is a cheap, idempotent re-store, so acting on
+ * a stale verdict costs a redundant request. It is NOT correct for anything irreversible or
+ * externally visible — a force-rekey encrypts to THIS DEVICE'S view of the members, so a stale
+ * "level" verdict authorises a write from a members list we already know may be behind, and
+ * silently drops anyone added since. That fails OPEN.
+ *
+ * Before reading either Set, check its lifetime against what YOU are about to do with it rather
+ * than against what its existing caller does. `hashSettledAt` was made time-bounded for exactly
+ * this reason and the same reasoning was never applied one declaration up.
  */
 const swarmsLevelWithLocalState = new Set<AccountPubkey>();
 const swarmsWithIncompleteMerge = new Set<AccountPubkey>();
