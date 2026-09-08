@@ -194,4 +194,42 @@ describe('ConfigRecovery force rekey', () => {
     expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
     expect(rekeyStub.callCount, 'exactly one generation minted').to.be.eq(1);
   });
+
+  it('the 24h cooldown lapses — a failed rekey is retried, but not before 24h', async () => {
+    // The cooldown is a SEPARATE guard from the once-per-session set above, and it is the only one
+    // of the two that can lapse: the session set is only written on success, so the cooldown's
+    // reachable job is throttling RETRIES after a rekey that threw. Untested, a guard that never
+    // lapses would leave such a group unable to ever try again, and — because the interval is a
+    // full day — would be indistinguishable from a working guard for that whole day.
+    stubWarranted();
+    levelNow();
+
+    let now = 1_000_000;
+    ConfigRecoveryForceRekey.setNowForTesting(() => now);
+
+    // an attempt that FAILS: the cooldown is stamped before the call, the session set is not
+    rekeyStub.rejects(new Error('swarm unreachable'));
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
+    expect(rekeyStub.callCount, 'PREMISE: it genuinely attempted').to.be.eq(1);
+
+    rekeyStub.resolves(undefined as any);
+
+    // immediately after, and repeatedly: refused
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(rekeyStub.callCount, 'inside the window, however many polls run').to.be.eq(1);
+
+    // 2 hours later: still refused. This step is what pins the interval at 24h — without it a
+    // silent regression to a one-hour cooldown passes every other assertion here.
+    now += 2 * 60 * 60 * 1000;
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(rekeyStub.callCount, 'two hours is not a lapse').to.be.eq(1);
+
+    // a further 23 hours: the guard lapses and the failed rekey is retried.
+    // This step also discriminates WHICH guard refused above — the once-per-session set never
+    // lapses, so if it had been the blocker this would still read 1.
+    now += 23 * 60 * 60 * 1000;
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(rekeyStub.callCount, 'past 24h the group gets another chance').to.be.eq(2);
+  });
 });
