@@ -84,7 +84,7 @@ type AccountPubkey = PubkeyType | GroupPubkeyType;
  * The scoping is NOT uniform across these declarations, though it reads as if it should be and it
  * once was — the two Sets below are session-scoped, `hashSettledAt` is time-bounded.
  *
- * ⚠️ SESSION-SCOPED HERE MEANS PROCESS-LIFETIME, WHICH ON DESKTOP IS WEEKS. Nothing ages these Sets
+ * SESSION-SCOPED HERE MEANS PROCESS-LIFETIME, WHICH ON DESKTOP IS WEEKS. Nothing ages these Sets
  * out: `swarmsLevelWithLocalState` is added to on the first good poll of the process and removed
  * only by the sticky merge-incomplete withdrawal. So `localStateIsLevelWithSwarm` answers "was
  * level at SOME POINT since startup", never "is level now", and the staleness it permits is
@@ -128,7 +128,7 @@ const swarmsWithIncompleteMerge = new Set<AccountPubkey>();
  *   - it was stored successfully; or
  *   - a guard ruled it out.
  *
- * ⚠️ A Map rather than a Set, and "at" rather than "this session", because the bar is TIME-BOUNDED
+ * A Map rather than a Set, and "at" rather than "this session", because the bar is TIME-BOUNDED
  * — see HASH_BAR_MS. This was first written as a permanent, session-scoped bar, justified by the
  * claim that no guard's verdict can change within a session. That sentence is false on any session
  * measured in hours, which on Desktop is all of them (there is no foreground gate): a kicked group can
@@ -167,7 +167,7 @@ const recoveryAttemptsBySwarm = new Map<
  * persistently-failing store is retried on every poll — every few seconds — which is the re-push
  * storm this design exists to avoid.
  *
- * ⚠️ Why a backoff and NOT a "give up after N rounds" cap, which is what this was first written as:
+ * Why a backoff and NOT a "give up after N rounds" cap, which is what this was first written as:
  * a cap re-creates the very exclusion the rate limit was corrected to remove, one layer up. Three transient
  * network failures would withdraw the device for the rest of the session — and a Desktop session can
  * be days — while intermittent connectivity correlates with having been offline long enough for the
@@ -192,7 +192,7 @@ let nowMs: () => number = () => Date.now();
 /**
  * How long a successfully re-stored hash is barred from being re-stored again.
  *
- * ⚠️ NOT "for the session". A session is unbounded in time and the config TTL is 30 days, so on
+ * NOT "for the session". A session is unbounded in time and the config TTL is 30 days, so on
  * Desktop — which has no foreground gate and runs for weeks by design — a session-scoped
  * bar can outlive the TTL. The hash would then expire from the swarm a second time and the bar
  * would block the very recovery that should put it back, on exactly the long-lived sessions where
@@ -213,7 +213,7 @@ const RECOVERY_BACKOFF_CEILING_MS = 30 * DURATION.MINUTES;
  * How long to wait before the next recovery round for a swarm, given consecutive FAILED rounds.
  * 60s doubling, ceilinged at 30 minutes, reset to zero by any successful store.
  *
- * ⚠️ The ceiling bounds the INTERVAL, never the NUMBER OF ATTEMPTS. This must not become a
+ * The ceiling bounds the INTERVAL, never the NUMBER OF ATTEMPTS. This must not become a
  * consecutive-failure cap: that is the exclusion shape this feature has already produced twice, and it
  * would exclude exactly the swarms most in need of repair. A permanently failing swarm keeps being
  * retried, just rarely — ~48 rounds a day rather than ~1,440.
@@ -281,7 +281,7 @@ function markLocalStateLevelWithSwarm(pubkey: AccountPubkey) {
  * best-effort repair, so deferring it to the next app start costs almost nothing, where acting on a
  * view we know to be incomplete is the thing this precondition exists to prevent.
  *
- * ⚠️ Known correlated exclusion, found by asking which population this excludes. "Deferred to the
+ * Known correlated exclusion, found by asking which population this excludes. "Deferred to the
  * next app start" is only true for a
  * TRANSIENT merge failure. If a config message on the swarm is *permanently* unmergeable — corrupt,
  * or written by a client newer than we can parse — then every session fetches it, fails, and
@@ -304,7 +304,7 @@ function localStateIsLevelWithSwarm(pubkey: AccountPubkey) {
  * Were we level as of the poll currently running for this swarm — not merely at some point since
  * the process started?
  *
- * ⚠️ Fails CLOSED. A swarm we have never polled, never marked, or withdrawn answers false, because
+ * Fails CLOSED. A swarm we have never polled, never marked, or withdrawn answers false, because
  * the only consumer is an irreversible write and "we do not know" must not read as "yes".
  */
 function localStateIsLevelAsOfCurrentPoll(pubkey: AccountPubkey) {
@@ -327,11 +327,9 @@ function recordDetection(pubkey: AccountPubkey, detection: ConfigExpiryDetection
   if (!detection.missingHashes.length) {
     // Deliberately NOT clearing what earlier polls recorded. A hash whose store FAILED is exactly
     // the thing we want a later poll to retry, and forgetting it is not how that retry is bounded —
-    // the backoff is. (This used to cite MAX_RECOVERY_ROUNDS_PER_SWARM, which was replaced by the
-    // backoff and no longer exists; the behaviour was right, the stated reason was not.)
-    // So a clearing step here could only destroy findings, including on a wrongly-conclusive
-    // result, without ever preventing a redundant re-store. Hashes are dropped once SETTLED
-    // instead — see pruneSettledDetections.
+    // the backoff is. So a clearing step here could only destroy findings, including on a
+    // wrongly-conclusive result, without ever preventing a redundant re-store. Hashes are dropped
+    // once SETTLED instead — see pruneSettledDetections.
     return;
   }
 
@@ -436,14 +434,12 @@ async function userVariantsNeedingRestore(missingHashes: Array<string>) {
  * next round is strictly smaller. Deliberately separate from `stored`: a swarm where one of several
  * configs succeeded is converging, and backing off would penalise it for that.
  *
- * ⚠️ This was once `anyPartLanded` — "any sub-request returned 200" — and that was a re-push storm.
- * Every part of a multipart config goes back on every attempt, so a config whose parts half-land
- * sends the IDENTICAL request next round. One part that always succeeds beside one that always
- * fails then reset the counter forever: nothing barred, `backoffMsFor(0)` is 0, full re-send on
- * every poll. Measured at 10 rounds / 10 sends / 0 barred before the fix.
- *
- * The question is not "did anything land" but "did anything become BARRED" — only the second makes
- * the next round smaller, and only the second is progress.
+ * `progressed` must mean "a hash became BARRED", never "some sub-request returned 200". Every part
+ * of a multipart config goes back on every attempt, so a config whose parts half-land sends the
+ * IDENTICAL request next round; if that counted as progress, one part that always succeeds beside
+ * one that always fails would reset the failure counter forever — nothing barred, `backoffMsFor(0)`
+ * is 0, a full re-send on every poll. Measured at 10 rounds / 10 sends / 0 barred. Only a hash
+ * becoming barred makes the next round smaller, so only that is progress.
  */
 async function restoreUserConfigs(
   variants: Array<ConfigWrapperUser>
@@ -600,7 +596,7 @@ async function groupConfigsNeedingRestore(groupPk: GroupPubkeyType, missingHashe
       return { needingRestore, coveredHashes, inspectedEverything: true, keysUnrecoverableHere };
     }
 
-    // Clean configs only — but ⚠️ this gate does NOT apply to GroupKeys.
+    // Clean configs only — but this gate does NOT apply to GroupKeys.
     //
     // The gate exists so local state cannot overwrite newer remote state. Keys recovery replays the
     // exact bytes the swarm already had — byte-identical, same hash — so it cannot overwrite
@@ -685,7 +681,7 @@ async function restoreGroupConfigs(
   // NOT in it and cannot be: it re-serialises current state, and a keys message is admin-signed
   // with padding derived from the group secret key, so a member could not produce a valid one.
   //
-  // ⚠️ It DRAINS the obsolete-hash list despite reading like a query, because it calls push()
+  // It DRAINS the obsolete-hash list despite reading like a query, because it calls push()
   // underneath. So this is the only time we will see those hashes — and it is why it is only called
   // when a config that needs it is actually being restored.
   const pushed = needsPushed ? await MetaGroupWrapperActions.pushForRecovery(groupPk) : null;
@@ -694,7 +690,7 @@ async function restoreGroupConfigs(
 
   // Keys come from retained BYTES rather than from a re-serialise — that is the whole mechanism.
   //
-  // ⚠️ ALL retained messages go back, not only the ones reported missing. A generation is the full
+  // ALL retained messages go back, not only the ones reported missing. A generation is the full
   // rekey plus every supplemental issued against it, and a member who receives only part of a
   // generation does not get the key — so a partial re-store can leave the group unreadable for
   // someone. Re-storing everything is a superset of "every message of the affected generation",
@@ -910,7 +906,7 @@ async function runRecoveryRound(pubkey: AccountPubkey): Promise<boolean> {
       }
     );
 
-    // ⚠️ ORDER MATTERS, and it is the only reason this works. `pruneSettledDetections` reads
+    // ORDER MATTERS, and it is the only reason this works. `pruneSettledDetections` reads
     // `hashSettledAt` to decide what is finished with; `pruneExpiredBars` removes entries from it.
     // Run the other way round, a bar that has just expired takes its hash out of `hashSettledAt`
     // first, the detection then looks unfinished, and it is retained forever — the leak survives
@@ -1046,7 +1042,7 @@ async function keysHashesWeLackBytesFor(groupPk: GroupPubkeyType) {
 /**
  * Re-fetch and re-merge a group's keys messages so libSession retains their bytes.
  *
- * ⚠️ PROACTIVE, NOT ON DETECTION, and that distinction is the whole value. Detection fires when the
+ * PROACTIVE, NOT ON DETECTION, and that distinction is the whole value. Detection fires when the
  * swarm has already LOST a hash — by then there is nothing left to fetch and this can do nothing.
  * This fires while the message is still there, which is the only window in which it works.
  *
@@ -1069,7 +1065,7 @@ async function backfillGroupKeys(groupPk: GroupPubkeyType): Promise<boolean> {
     throw new Error('backfillGroupKeys: no snode in swarm');
   }
 
-  // ⚠️ The retrieve layer DIRECTLY, never the poll wrapper. `pollNodeForKey` writes the namespace
+  // The retrieve layer DIRECTLY, never the poll wrapper. `pollNodeForKey` writes the namespace
   // cursor from whatever it fetched (swarmPolling.ts:902), and this asks with NO last_hash, so
   // routing through it would advance the cursor past messages the poll never consumed. Nothing
   // below the retrieve writes the cursor — the only writers are that call site and the Data helper
@@ -1105,7 +1101,7 @@ async function backfillGroupKeys(groupPk: GroupPubkeyType): Promise<boolean> {
     groupMember: [],
   });
 
-  // ⚠️ The merge alone is not enough, and the difference is invisible in-process. Retention lives in
+  // The merge alone is not enough, and the difference is invisible in-process. Retention lives in
   // the config DUMP, so bytes captured by a merge that never persists die with the process: the
   // backfill appears to work and silently does not, and any test asserting within one run passes
   // either way.
@@ -1127,13 +1123,13 @@ async function backfillGroupKeysIfNeeded(groupPk: GroupPubkeyType) {
     }
 
     if (await backfillGroupKeys(groupPk)) {
-      // ⚠️ CLEARED on success rather than left alone. This record is read as "this device cannot
+      // CLEARED on success rather than left alone. This record is read as "this device cannot
       // repair this group", and a device that just retained the bytes plainly can.
       keysBackfillFailedAt.delete(groupPk);
       return;
     }
 
-    // ⚠️ Means ATTEMPTED AND THE BYTES ARE STILL ABSENT — not "the fetch came back empty". A fetch
+    // Means ATTEMPTED AND THE BYTES ARE STILL ABSENT — not "the fetch came back empty". A fetch
     // returning messages that still do not restore the bytes is equally a failed attempt, and
     // recording only the empty case leaves the group looking un-attempted forever while re-fetching
     // the same useless messages every eligible poll.

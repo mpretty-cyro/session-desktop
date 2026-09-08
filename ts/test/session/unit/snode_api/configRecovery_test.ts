@@ -374,7 +374,7 @@ describe('ConfigRecovery', () => {
     // round. Nothing barred, backoffMsFor(0) is 0, identical full re-send on every poll — measured
     // at 10 rounds / 10 sends / 0 barred.
     //
-    // ⚠️ This test pins the SIZE of the retry, not its existence. The version it replaces asserted
+    // This test pins the SIZE of the retry, not its existence. The version it replaces asserted
     // only that a second attempt happened, which is true of the storm too — that is precisely why
     // the defect survived: every part goes back on every attempt, so a half-landing config
     // never shrinks its next round and "it retried" cannot distinguish progress from a loop.
@@ -446,7 +446,7 @@ describe('ConfigRecovery', () => {
     // Hashes rotate on every re-push and a Desktop session runs for days, so every superseded hash
     // would otherwise be retained forever.
     //
-    // ⚠️ The hashes must ROTATE between rounds, exactly as in the bars test. Re-detecting the same
+    // The hashes must ROTATE between rounds, exactly as in the bars test. Re-detecting the same
     // hashes writes the same Set entries, so the size is unchanged whether or not it prunes — a
     // version of this reusing one hash set passes with the pruning removed.
     let fakeNow = 1_700_000_000_000;

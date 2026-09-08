@@ -45,7 +45,8 @@ function expectExpireWith({
 } & WithShortenOrExtend) {
   expect(request.messageHashes).to.be.deep.eq(hashes);
   expect(request.shortenOrExtend).to.be.eq(shortenOrExtend);
-  // Note: this used to assert `above` twice, so it never actually bounded the expiry.
+  // Both bounds are required, and the second must be `below`: two `above` assertions typecheck,
+  // read as a range, and leave the expiry unbounded upwards.
   expect(request.expiryMs).to.be.above(NetworkTime.now() + TTL_DEFAULT.CONFIG_MESSAGE - 1000);
   expect(request.expiryMs).to.be.below(NetworkTime.now() + TTL_DEFAULT.CONFIG_MESSAGE + 1000);
 }

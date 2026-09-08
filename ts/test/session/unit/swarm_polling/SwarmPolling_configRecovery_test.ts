@@ -32,9 +32,9 @@ const { expect } = chai;
  * ConfigRecovery directly.
  *
  * A device whose config has expired gets nothing back when it polls, because there is nothing left
- * on the swarm to return. The level-with-swarm rule originally read "a successful poll *and merge*", and taken
- * literally that means recovery can never run for exactly those devices — and it fails silently:
- * detection runs, the guard declines, no error and no failing test.
+ * on the swarm to return. So the level-with-swarm rule must not demand a *merge*: read as "a
+ * successful poll AND merge" it can never be satisfied by exactly those devices, and it fails
+ * silently — detection runs, the guard declines, no error and no failing test.
  *
  * A unit test against ConfigRecovery cannot catch that, because supplying the precondition in
  * setup is what hides it. So this one drives `pollOnceForKey` with an empty swarm and asserts the

@@ -112,10 +112,11 @@ function mergeMultipleRetrieveResults(
     // A namespace ANSWERED if any snode we polled returned 200 for it: the messages above are the
     // union across snodes, so one snode failing does not cost us that namespace's content.
     //
-    // This used to be `results.find(...)?.code || 200`, which was wrong twice. `find` takes the
-    // first entry for the namespace across all snodes, so the verdict depended on result ordering
-    // and was arbitrary in BOTH directions — not conservative. And `|| 200` turned a missing or
-    // zero code into a pass, defaulting the one direction that must never default.
+    // The verdict has to come from ALL codes for the namespace, and a missing code must never
+    // default to a pass. Taking the first entry (`find`) makes it depend on which snode happens to
+    // come back first — arbitrary in BOTH directions, so not conservative either — and a `|| 200`
+    // fallback turns a missing or zero code into an answer, defaulting the one direction that
+    // must not default.
     //
     // The only consumer is allConfigNamespacesAnswered, which decides whether we are level with the
     // swarm — so an unanswered namespace reading as answered is the failure that matters.

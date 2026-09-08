@@ -79,7 +79,7 @@ describe('ConfigRecovery (groups)', () => {
       groupMember: memberHashes,
       groupKeys: keysHashes,
     });
-    // ⚠️ Must be stubbed even for tests that are not about keys. Without it the call throws, the
+    // Must be stubbed even for tests that are not about keys. Without it the call throws, the
     // inspection reports "could not inspect" and every keys assertion below passes through the
     // error path instead of the rule it names.
     Sinon.stub(MetaGroupWrapperActions, 'activeKeyMessages').resolves(retainedKeyMessages);
@@ -155,9 +155,9 @@ describe('ConfigRecovery (groups)', () => {
   });
 
   it('V16a: one GroupKeys hash missing while another is PRESENT — no re-store, group not expired', async () => {
-    // ⚠️ The reason here CHANGED. It used to be "a keys message can never be put back". It now is
-    // "we retain no bytes for it" — this fixture holds none. A device that does hold them re-stores
-    // instead, which is V23. Kept as the no-bytes case because groups predating retention are real.
+    // The reason is "we retain no bytes for it", NOT "a keys message can never be put back" —
+    // this fixture holds none. A device that DOES hold them re-stores instead, which is V23. Kept
+    // as the no-bytes case because groups predating retention are real.
     stubGroup({ keysHashes: [KEYS_HASH, 'keyshash2'] });
     detectMissing([KEYS_HASH]);
     ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
@@ -402,9 +402,9 @@ describe('ConfigRecovery (groups)', () => {
   });
 
   it('Q4/V16: all keys hashes gone and NO retained bytes -> the group is flagged EXPIRED', async () => {
-    // Nothing used to set this flag from detection at all. The poller's empty-fetch branch cannot
-    // reach this case by construction: it requires holding NO config hashes, and a device in this
-    // state holds plenty — the hashes are exactly what told us they were missing.
+    // Detection is the only thing that can raise the flag for this case. The poller's empty-fetch
+    // branch cannot reach it by construction: that branch requires holding NO config hashes, and a
+    // device in this state holds plenty — the hashes are exactly what told us they were missing.
     const setExpired = Sinon.stub();
     Sinon.stub(ConvoHub, 'use').returns({
       get: () => ({
@@ -561,7 +561,7 @@ describe('ConfigRecovery (groups)', () => {
       // iOS hit this: retention lives in the config dump, so bytes captured by a merge that never
       // persists are gone on restart. It passes every in-process assertion either way.
       //
-      // ⚠️ On Desktop the hazard is worse: saveDumpsToDb is stubbed in this file's beforeEach for an
+      // On Desktop the hazard is worse: saveDumpsToDb is stubbed in this file's beforeEach for an
       // unrelated reason, so an implementation that never persists passes the whole suite silently.
       // Hence the PREMISE assertion first — without it "saveDumpsToDb was called" is also satisfied
       // by a path that exited before the merge.
@@ -586,7 +586,7 @@ describe('ConfigRecovery (groups)', () => {
     });
 
     it('records a failure when messages ARRIVE but the bytes are still absent', async () => {
-      // 🔴 The one that separates "attempted and still absent" from "the fetch was empty". Both look
+      // The one that separates "attempted and still absent" from "the fetch was empty". Both look
       // identical in any fixture where the swarm has nothing — which is the fixture above, and the
       // first one anyone writes. An implementation that only records the empty case passes that one
       // and fails this, and without this test it would refetch the same useless messages forever.

@@ -63,7 +63,7 @@ describe('configExpiryDetection', () => {
     expect(result).to.be.deep.eq({ status: 'conclusive', missingHashes: [H2] });
   });
 
-  // ⚠️ The failed nodes below CARRY an `unchanged` array on purpose, and it must stay.
+  // The failed nodes below CARRY an `unchanged` array on purpose, and it must stay.
   //
   // Without it they are already unreadable, so the eligibility check excludes them on that ground
   // and never consults `failed` at all — the `failed` term could then be deleted with the whole
@@ -181,10 +181,10 @@ describe('configExpiryDetection', () => {
     });
 
     it('V14: asking about no hashes is INCONCLUSIVE, not "nothing missing"', () => {
-      // This test previously asserted 'conclusive' — the natural short-circuit, and wrong. A
-      // conclusive result outranks the empty-fetch check, so reporting
-      // one here would make detection the authority for a swarm it never asked about, and the
-      // check that should decide the no-hashes case could never fire.
+      // 'conclusive' is the natural short-circuit here, and it is wrong: a conclusive result
+      // outranks the empty-fetch check, so reporting one for a swarm detection never asked about
+      // would make detection the authority for it, and the check that should decide the no-hashes
+      // case could never fire.
       const result = detect(swarmOf({ updated: [], unchanged: {} }), { requestedHashes: [] });
 
       expect(result).to.be.deep.eq({ status: 'inconclusive' });

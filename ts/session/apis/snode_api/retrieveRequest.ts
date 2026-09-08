@@ -269,12 +269,12 @@ async function retrieveNextMessagesNoRetries(
     // position, so a missing result does not drop a namespace — it shifts every later one onto its
     // neighbour's messages.
     //
-    // This used to accept `namespacesAndLastHashes.length` OR that +1, to allow for the `expire`
-    // sub-request only being appended when there are config hashes to bump. But two accepted
-    // lengths is the same hole as a filter: with `expire` appended, a response that dropped one
-    // retrieve result lands on the lower bound, passes, and then the LAST namespace is handed the
-    // expire result as its messages. `rawRequests` already accounts for the conditional
-    // sub-request, so comparing against it states the real invariant and admits only one length.
+    // Compare against `rawRequests`, never against `namespacesAndLastHashes.length` or that +1.
+    // The `expire` sub-request is appended only when there are config hashes to bump, so a bound
+    // written to allow for both admits two lengths — and two accepted lengths is the same hole as a
+    // filter: with `expire` appended, a response that dropped one retrieve result lands on the lower
+    // bound, passes, and then the LAST namespace is handed the expire result as its messages.
+    // `rawRequests` already accounts for the conditional sub-request, so it admits exactly one.
     if (results.length !== rawRequests.length) {
       throw new Error(
         `We asked for ${rawRequests.length} sub-requests but got results of length ${results.length}`

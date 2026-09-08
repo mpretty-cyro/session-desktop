@@ -14,7 +14,7 @@ import { ConfigRecovery } from './configRecovery';
  * Last resort for a group whose keys are gone from the swarm and which no device here can repair:
  * an admin mints a new generation so the group becomes usable again.
  *
- * ⚠️ This is the only irreversible, universally visible write in config recovery. Every other part
+ * This is the only irreversible, universally visible write in config recovery. Every other part
  * replays bytes the swarm already had — byte-identical, same hash, invisible to every other client.
  * A rekey creates NEW state that every member on every version must process, and it cannot be
  * undone. Everything below is about not doing it when it was not needed.
