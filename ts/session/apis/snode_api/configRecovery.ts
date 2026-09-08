@@ -100,7 +100,27 @@ type AccountPubkey = PubkeyType | GroupPubkeyType;
  * than against what its existing caller does. `hashSettledAt` was made time-bounded for exactly
  * this reason and the same reasoning was never applied one declaration up.
  */
-const swarmsLevelWithLocalState = new Set<AccountPubkey>();
+/**
+ * pubkey -> the poll token that was current when we last marked this swarm level.
+ *
+ * A Map rather than a Set because two different consumers ask two different questions of it, and
+ * one field answers both:
+ *
+ *   has(pubkey)                  "were we EVER level this session"  — recovery's precondition
+ *   stored === current token     "are we level AS OF THIS POLL"     — the force rekey's
+ *
+ * Recovery is a cheap idempotent re-store, so acting on a stale verdict costs a redundant request
+ * and the sticky question is right for it. A rekey encrypts to this device's view of the members
+ * and cannot be undone, so it needs the poll-scoped one. Same value, two readings — deliberately
+ * NOT two fields, or they would drift.
+ */
+const swarmsLevelWithLocalState = new Map<AccountPubkey, number>();
+/**
+ * pubkey -> a token that changes every time a poll begins for that swarm.
+ *
+ * Per swarm, not global: a poll of some other pubkey must not invalidate this one's mark.
+ */
+const currentPollToken = new Map<AccountPubkey, number>();
 const swarmsWithIncompleteMerge = new Set<AccountPubkey>();
 /**
  * hash -> when it was settled, for either of two reasons that must not be conflated with a FAILED
@@ -230,12 +250,20 @@ function backoffMsFor(consecutiveFailures: number) {
  *
  * A failed or errored poll counts for neither.
  */
+/**
+ * Called when a poll STARTS for this swarm. Everything marked level before now becomes stale for
+ * any consumer asking the poll-scoped question.
+ */
+function beginPollForSwarm(pubkey: AccountPubkey) {
+  currentPollToken.set(pubkey, (currentPollToken.get(pubkey) ?? 0) + 1);
+}
+
 function markLocalStateLevelWithSwarm(pubkey: AccountPubkey) {
   if (swarmsWithIncompleteMerge.has(pubkey)) {
     // withdrawn for the session — see markMergeIncompleteForSwarm
     return;
   }
-  swarmsLevelWithLocalState.add(pubkey);
+  swarmsLevelWithLocalState.set(pubkey, currentPollToken.get(pubkey) ?? 0);
 }
 
 /**
@@ -270,6 +298,20 @@ function markMergeIncompleteForSwarm(pubkey: AccountPubkey) {
 
 function localStateIsLevelWithSwarm(pubkey: AccountPubkey) {
   return swarmsLevelWithLocalState.has(pubkey);
+}
+
+/**
+ * Were we level as of the poll currently running for this swarm — not merely at some point since
+ * the process started?
+ *
+ * ⚠️ Fails CLOSED. A swarm we have never polled, never marked, or withdrawn answers false, because
+ * the only consumer is an irreversible write and "we do not know" must not read as "yes".
+ */
+function localStateIsLevelAsOfCurrentPoll(pubkey: AccountPubkey) {
+  const markedAt = swarmsLevelWithLocalState.get(pubkey);
+  const current = currentPollToken.get(pubkey);
+
+  return markedAt !== undefined && current !== undefined && markedAt === current;
 }
 
 /**
@@ -969,6 +1011,7 @@ function setNowForTesting(fn: () => number) {
 function resetForTesting() {
   nowMs = () => Date.now();
   swarmsLevelWithLocalState.clear();
+  currentPollToken.clear();
   swarmsWithIncompleteMerge.clear();
   recoveryAttemptsBySwarm.clear();
   hashSettledAt.clear();
@@ -1171,6 +1214,8 @@ export const ConfigRecovery = {
   barredHashCountForTesting,
   trackedDetectionCountForTesting,
   markLocalStateLevelWithSwarm,
+  beginPollForSwarm,
+  localStateIsLevelAsOfCurrentPoll,
   setNowForTesting,
   markMergeIncompleteForSwarm,
   localStateIsLevelWithSwarm,

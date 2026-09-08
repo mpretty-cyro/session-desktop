@@ -39,20 +39,15 @@ const lastAttemptAt = new Map<GroupPubkeyType, number>();
 
 let nowMs: () => number = () => Date.now();
 
-/**
- * @param levelWithSwarmThisPoll whether our view of this group's members is level with the swarm AS
- * OF THE POLL THAT IS CALLING US — not "at some point this session". The caller computes it; we
- * refuse without it rather than trusting that the caller checked, so the refusal is testable here
- * rather than only observable by its absence at the call site.
- */
-async function forceRekeyIfPossible(
-  groupPk: GroupPubkeyType,
-  { levelWithSwarmThisPoll }: { levelWithSwarmThisPoll: boolean }
-): Promise<boolean> {
+async function forceRekeyIfPossible(groupPk: GroupPubkeyType): Promise<boolean> {
   try {
-    if (!levelWithSwarmThisPoll) {
-      // Our members list may be behind, and a rekey from a stale one silently drops whoever was
-      // added since. Refusing costs a poll cycle; proceeding costs someone their access.
+    // Asked of the store rather than taken as an argument. The store stamps each level mark with
+    // the poll it came from, so this compares that stamp against the poll running now — a caller
+    // cannot supply a value it likes, only be wrong about when it called.
+    //
+    // Our members list may otherwise be behind, and a rekey from a stale one silently drops whoever
+    // was added since. Refusing costs a poll cycle; proceeding costs someone their access.
+    if (!ConfigRecovery.localStateIsLevelAsOfCurrentPoll(groupPk)) {
       return false;
     }
 

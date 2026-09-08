@@ -60,6 +60,7 @@ describe('ConfigRecovery force rekey', () => {
   beforeEach(() => {
     TestUtils.stubWindowLog();
     ConfigRecoveryForceRekey.resetForTesting();
+    ConfigRecovery.resetForTesting();
     groupPk = TestUtils.generateFakeClosedGroupV2PkStr();
     rekeyStub = Sinon.stub(MetaGroupWrapperActions, 'keyRekey').resolves(undefined as any);
     Sinon.stub(LibSessionUtil, 'saveDumpsToDb').resolves();
@@ -70,12 +71,17 @@ describe('ConfigRecovery force rekey', () => {
     Sinon.restore();
   });
 
-  const fresh = { levelWithSwarmThisPoll: true };
+  /** put the store into "level as of the poll running now" */
+  function levelNow() {
+    ConfigRecovery.beginPollForSwarm(groupPk);
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+  }
 
   it('rekeys when nothing here can restore the keys — the baseline every refusal is measured against', async () => {
     stubWarranted();
+    levelNow();
 
-    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh);
+    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
 
     expect(did, 'the fixture genuinely rekeys').to.be.true;
     expect(rekeyStub.calledOnceWith(groupPk)).to.be.true;
@@ -95,9 +101,8 @@ describe('ConfigRecovery force rekey', () => {
     // known to be degraded, so "behind" is the expected condition rather than the unlucky one.
     stubWarranted();
 
-    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, {
-      levelWithSwarmThisPoll: false,
-    });
+    // no mark for the current poll — the store answers false
+    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
 
     expect(did).to.be.false;
     expect(rekeyStub.called, 'nothing minted from a members list we know may be behind').to.be
@@ -109,8 +114,9 @@ describe('ConfigRecovery force rekey', () => {
     // ever run" — identical on a fresh install, a restored backup, or before the first poll
     // completes. Only the first justifies this.
     stubWarranted({ backfillFailed: false });
+    levelNow();
 
-    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh);
+    const did = await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
 
     expect(did).to.be.false;
     expect(backfillFailedStub.called, 'PREMISE: it actually consulted the record').to.be.true;
@@ -123,32 +129,69 @@ describe('ConfigRecovery force rekey', () => {
       keysHashes: ['keyshash1', 'keyshash2'],
       retained: { keyshash2: new Uint8Array([1]) },
     });
+    levelNow();
 
-    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh)).to.be.false;
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
     expect(rekeyStub.called).to.be.false;
   });
 
   it('REFUSES for a member — only an admin can mint a key', async () => {
     stubWarranted({ secretKey: null });
+    levelNow();
 
-    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh)).to.be.false;
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
     expect(rekeyStub.called).to.be.false;
   });
 
   it('REFUSES for a kicked or destroyed group', async () => {
     stubWarranted({ destroyed: true });
+    levelNow();
 
-    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh)).to.be.false;
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
     expect(rekeyStub.called).to.be.false;
+  });
+
+  it('V25e: refuses when the level mark is from a PREVIOUS poll', async () => {
+    // The whole point of the poll token. A device that was level yesterday and has not completed a
+    // poll since still answers true to the sticky question, and its members list may be behind by
+    // exactly the member a rekey would drop. Three states, one fixture, asserting on the rekey
+    // count rather than the return value so a refusal cannot be confused with a throw.
+    stubWarranted();
+
+    // 1. a poll has begun, nothing marked -> nothing to be level from
+    ConfigRecovery.beginPollForSwarm(groupPk);
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(rekeyStub.callCount, 'unmarked poll: refuse').to.be.eq(0);
+
+    // 2. marked during THIS poll -> proceed
+    ConfigRecovery.markLocalStateLevelWithSwarm(groupPk);
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(rekeyStub.callCount, 'marked this poll: proceed').to.be.eq(1);
+
+    // 3. a NEW poll begins, so the mark is now from the previous one -> refuse
+    ConfigRecoveryForceRekey.resetForTesting(); // clear the once-per-session guard, isolating this rule
+    ConfigRecovery.beginPollForSwarm(groupPk);
+    await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk);
+    expect(
+      rekeyStub.callCount,
+      'a new poll makes the earlier mark stale, even though the sticky question still says level'
+    ).to.be.eq(1);
+
+    // and the sticky question DOES still say level — otherwise this test passes for the wrong reason
+    expect(
+      ConfigRecovery.localStateIsLevelWithSwarm(groupPk),
+      'PREMISE: the sticky reading is still true, so only the poll-scoped one refused'
+    ).to.be.true;
   });
 
   it('rekeys a group ONCE — a second call in the same session is refused', async () => {
     // Without this, every poll that still sees the old preconditions mints another generation, and
     // each one is a write every member on every version has to process.
     stubWarranted();
+    levelNow();
 
-    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh)).to.be.true;
-    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk, fresh)).to.be.false;
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.true;
+    expect(await ConfigRecoveryForceRekey.forceRekeyIfPossible(groupPk)).to.be.false;
     expect(rekeyStub.callCount, 'exactly one generation minted').to.be.eq(1);
   });
 });

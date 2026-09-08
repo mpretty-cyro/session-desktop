@@ -471,6 +471,11 @@ export class SwarmPolling {
    * Only exposed as public for testing
    */
   public async pollOnceForKey([pubkey, type]: PollForUs | PollForLegacy | PollForGroup) {
+    // A poll for this swarm starts here, which invalidates any earlier level mark for anything
+    // asking the poll-scoped question. Minted at the START deliberately: a token taken at the end
+    // would be the poll that just finished, and the rekey would compare a mark against its own poll
+    // and always agree.
+    ConfigRecovery.beginPollForSwarm(pubkey);
     const namespaces = this.getNamespacesToPollFrom(type);
     const swarmSnodes = await SnodePool.getSwarmFor(pubkey);
     let resultsFromAllNamespaces: RetrieveMessagesResultsMergedBatched | null;
@@ -586,10 +591,6 @@ export class SwarmPolling {
       ConfigRecovery.markMergeIncompleteForSwarm(pubkey);
     }
 
-    // Named rather than inlined into the `if`, because the force rekey below is HANDED this value.
-    // Passing a literal `true` from inside the branch would be correct only for as long as the call
-    // stays inside it — the value would silently become a lie the moment anyone moved it. This way
-    // the thing asserted and the thing computed are the same expression.
     const levelWithSwarmThisPoll =
       atLeastOneSnodeAnswered &&
       allConfigNamespacesAnswered(resultsFromAllNamespaces, type) &&
@@ -611,7 +612,7 @@ export class SwarmPolling {
         // and nothing downstream can reconstruct it: the level marker is set once per process and
         // never says whether it is still true. A rekey encrypts to our current view of the members,
         // so a stale view silently drops anyone added since.
-        void ConfigRecoveryForceRekey.forceRekeyIfPossible(pubkey, { levelWithSwarmThisPoll });
+        void ConfigRecoveryForceRekey.forceRekeyIfPossible(pubkey);
       }
     }
 
